@@ -1,0 +1,957 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meshpi</title>
+<link rel="icon" href="data:,">
+<meta name="theme-color" content="#0b1220">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script>  // тема до відмальовування, щоб не було спалаху (як у style.css)
+  try { document.documentElement.dataset.theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); }
+  catch (e) { /* без сховища — темна */ }
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&amp;family=Space+Grotesk:wght@400;600;700&amp;display=swap">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="brand"><div class="ring"><span class="ring-dot"></span></div>
+    <div><h1>Meshpi</h1><p id="me">Meshtastic · Raspberry Pi</p></div></div>
+  <div class="row"><span id="pill" class="status-pill"><span class="dot"></span><span id="pilltxt">…</span></span>
+    <button type="button" id="theme" class="settings-link" title="Світла/темна тема">☾</button>
+    <form method="post" action="/logout" style="margin:0"><button class="check-btn" title="Вийти з панелі">Вийти</button></form></div>
+</header>
+<nav id="tabbar" class="tabbar" role="tablist" aria-label="Розділи">
+  <button type="button" role="tab" data-tab="overview">Огляд</button>
+  <button type="button" role="tab" data-tab="messages">Повідомлення</button>
+  <button type="button" role="tab" data-tab="nodes">Вузли</button>
+  <button type="button" role="tab" data-tab="radio">Радіо</button>
+  <button type="button" role="tab" data-tab="node">Вузол</button>
+  <button type="button" role="tab" data-tab="system">Система</button>
+</nav>
+<main>
+  <div id="offline" class="strip" hidden><span class="label" style="color:var(--crit)">Немає зв'язку</span><span id="offtxt" class="hint"></span></div>
+  <div class="tabpane" data-tab="overview" role="tabpanel" hidden>
+<div id="stats" class="grid"></div>
+<div id="sys" class="grid"></div>
+<section class="panel" id="envbox">
+    <h2 id="envtitle">Довкілля</h2>
+    <p id="envnote" class="hint" style="margin:0 0 12px"></p>
+    <div id="envgrid" class="envgrid"></div>
+    <details id="envsrc" hidden style="margin-top:12px">
+      <summary class="hint" style="cursor:pointer">Джерела даних</summary>
+      <div class="table-wrap"><table><thead><tr id="envsrchead"></tr></thead><tbody id="envsrcbody"></tbody></table></div>
+    </details>
+  </section>
+<div class="strip"><span class="label">Стан</span><span id="health" class="row" style="gap:10px"></span></div>
+<pre id="errs" style="margin:-8px 0 20px;white-space:pre-wrap;color:var(--crit)"></pre>
+<details id="chartsbox" class="panel" open>
+    <summary><h2>Графіки</h2></summary>
+    <div class="row"><select class="tg-input" id="hrs"><option value="1">1 год</option><option value="6">6 год</option><option value="24" selected>24 год</option><option value="168">7 діб</option></select></div>
+    <div id="charts"></div>
+  </details>
+  </div>
+  <div class="tabpane" data-tab="messages" role="tabpanel" hidden>
+<section class="panel">
+    <h2>Повідомлення</h2>
+    <div class="row" style="margin-bottom:8px">
+      <div id="tabs" class="tabs" role="tablist" aria-label="Розмови"></div>
+      <button type="button" id="forget" class="check-btn" hidden title="Видалити розмову й усю її історію на платі">🗑 Видалити розмову</button>
+      <label title="Звук і сповіщення про нові повідомлення, поки вкладка відкрита"><input type="checkbox" id="notify"> 🔔 сповіщати</label>
+    </div>
+    <div id="log"></div>
+    <div id="replybar" class="replybar" hidden><span></span><button type="button" class="react-btn" title="Скасувати відповідь (Esc)">✕</button></div>
+    <form id="send" class="row">
+      <select class="tg-input" id="to"><option value="^all">Усім</option></select>
+      <label>Канал <input class="tg-input" id="ch" type="number" min="0" max="7" value="0"></label>
+      <input class="tg-input" id="text" placeholder="Текст повідомлення" required autocomplete="off">
+      <button type="button" id="emo" class="check-btn" title="Вставити емодзі" aria-expanded="false">☺</button>
+      <button class="check-btn">➤ Надіслати</button>
+    </form>
+    <div id="emopanel" class="emo-panel" hidden></div>
+  </section>
+  </div>
+  <div class="tabpane" data-tab="nodes" role="tabpanel" hidden>
+<section class="panel">
+    <h2>Вузли</h2>
+    <div class="row" style="margin-bottom:8px">
+      <input class="tg-input" id="q" placeholder="Пошук за назвою або ID" autocomplete="off">
+      <label><input type="checkbox" id="favonly"> лише обрані ★</label>
+      <label title="Сховати вузли, відомі лише через MQTT-міст, а не з радіоефіру"><input type="checkbox" id="nomqtt" checked> без MQTT</label>
+      <label><input type="checkbox" id="pos"> з координатами</label>
+      <label>почуті за <select class="tg-input" id="age"><option value="3600">1 год</option><option value="43200">12 год</option><option value="86400" selected>24 год</option><option value="604800">7 діб</option><option value="0">увесь час</option></select></label>
+      <span id="ncount" class="hint"></span>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>★</th><th data-s="name">Назва</th><th data-s="id">ID</th><th data-s="snr">SNR</th><th data-s="rssi">RSSI</th><th data-s="hops">Стрибки</th><th>Координати</th><th>Довкілля</th><th data-s="dist" title="Від розташування, заданого в налаштуваннях">Відстань</th><th data-s="heard">Востаннє чутно</th></tr></thead>
+      <tbody id="nodes"></tbody>
+    </table></div>
+    <div id="nd" hidden style="margin-top:16px;border-top:1px solid var(--line);padding-top:16px">
+      <div class="row" style="margin-bottom:10px">
+        <b id="ndname"></b><code id="ndid"></code><span id="ndhw" class="hint"></span>
+        <button type="button" class="check-btn" data-k="user" title="Запросити назву й модель">👤 Дані</button>
+        <button type="button" class="check-btn" data-k="trace" title="Через які вузли йде зв'язок">↝ Маршрут</button>
+        <button type="button" class="check-btn" data-k="signal" title="SNR/RSSI відповіді вузла">📶 Сигнал</button>
+        <button type="button" class="check-btn" data-k="device" title="Батарея, напруга, ефір">🔋 Показники</button>
+        <button type="button" id="ndx" class="reboot-btn" title="Закрити">✕</button>
+      </div>
+      <pre id="ndout" style="white-space:pre-wrap;margin:0"></pre>
+      <p class="hint" style="margin-top:8px">Кожен запит — передача в ефір; відповідь може йти до хвилини, повтор — не частіше ніж раз на 30 с.</p>
+    </div>
+  </section>
+<section id="mapbox" class="panel" hidden>
+    <h2>Карта (плитки — OpenStreetMap, потрібен інтернет у браузері)</h2>
+    <div id="map" style="height:480px;border-radius:8px"></div>
+  </section>
+  </div>
+  <div class="tabpane" data-tab="radio" role="tabpanel" hidden>
+<div id="pwr" class="grid"></div>
+<section class="panel">
+    <h2>Радіо</h2>
+    <form id="radio" class="row">
+      <label>Регіон <select class="tg-input" id="region"></select></label>
+      <label>Пресет <select class="tg-input" id="preset"></select></label>
+      <label>Потужність, дБм <input class="tg-input" id="tx" type="number" min="0" max="22" value="0"></label>
+      <label>Hop limit <input class="tg-input" id="hop" type="number" min="1" max="7" value="3"></label>
+      <label title="0 = автоматично (за назвою каналу); мережа спільноти 433.125 МГц — слот 1">Слот частоти <input class="tg-input" id="slot" type="number" min="0" max="255" value="0"></label>
+      <button class="check-btn">✓ Зберегти</button>
+    </form>
+    <p id="ovr" class="hint" style="margin-top:12px;color:var(--crit)" hidden></p>
+    <p class="hint" style="margin-top:12px">Фактична потужність обмежена стелею регіону в прошивці (у стандартній — близько 10–12 дБм) і стелею чипа в конфігу (SX126X_MAX_POWER для E22, RF95_MAX_POWER для Ra-01/Ra-02 і RFM98PW).</p>
+    <details id="pwrdet" style="margin-top:12px" hidden>
+      <summary class="hint" style="cursor:pointer">Потужність на антені <span id="pwrmod"></span> залежно від налаштування</summary>
+      <table id="pwrtab" style="max-width:640px;margin-top:8px">
+        <thead><tr><th>Налаштування, дБм</th><th>На антені, дБм</th><th>На антені, мВт</th><th class="meas">Вимір власника, дБм / мВт</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint" style="margin-top:8px" data-mod="E22-400M33S">За графіком виробника (Ebyte «E22-M Series» v1.5, VCC 5 В, 25 °C): точки 1, 4, 7, 11, 16 і 21 дБм, між ними — лінійна інтерполяція; 22 (≈) — оцінка, графік закінчується на 21. Підсилювач модуля додає ~18 дБ на малій потужності й ~12 дБ на великій (насичення). Праворуч — виміри власника на його модулі (на ~0,5–1 дБ нижчі). Плитка на головній бере значення виробника.</p>
+      <p class="hint" style="margin-top:8px" data-mod="RFM98PW-433S2">Виміри в мВт, дБм пораховано з них. Чип SX1278 дає щонайбільше 20 дБм (RF95_MAX_POWER ≤ 20), тож рядки 21–22 тут недосяжні.</p>
+      <p class="hint" style="margin-top:4px">Рядок поточного значення «Потужність» підсвічено.</p>
+    </details>
+  </section>
+<section class="panel">
+    <h2>Потужність</h2>
+    <p id="pwrnote" class="hint" style="margin:0 0 12px"></p>
+    <p id="pkgnote" class="hint" style="margin:0 0 12px;color:var(--warn)" hidden></p>
+    <div class="row">
+      <label>Стеля, дБм <input class="tg-input" id="cap" type="number" min="1" max="22" value="22"></label>
+      <button type="button" id="pb" class="check-btn">⚙ Зібрати й підняти стелю</button>
+      <button type="button" id="pr" class="reboot-btn">↶ Повернути стандартну</button>
+    </div>
+    <details open style="margin-top:12px">
+      <summary class="hint" style="cursor:pointer">Вивід збирання</summary>
+      <pre id="pwrlog" style="line-height:16px;max-height:calc(50 * 16px);overflow:auto;margin-top:8px"></pre>
+    </details>
+  </section>
+<section class="panel">
+    <h2>Пошук мережі за пресетами</h2>
+    <p class="hint" style="margin:0 0 12px">Вузол по черзі перемикається на кожен обраний пресет і слухає ефір, а потім повертає початковий. Під час сканування він не чує вашу основну мережу, зв’язок із ним на кілька секунд зникає при кожній зміні пресета.</p>
+    <div id="scanpre" class="chips"></div>
+    <div class="row" style="margin-top:12px">
+      <label>Час на пресет <select class="tg-input" id="dwell">
+        <option value="60">1 хв</option><option value="300">5 хв</option><option value="600">10 хв</option>
+        <option value="900" selected>15 хв</option><option value="1800">30 хв</option><option value="3600">60 хв</option>
+      </select></label>
+      <button type="button" id="scgo" class="check-btn">▶ Почати сканування</button>
+      <button type="button" id="scstop" class="reboot-btn" hidden>■ Зупинити</button>
+    </div>
+    <p id="scmsg" class="hint" style="margin-top:12px" hidden></p>
+    <table id="sctab" style="margin-top:12px" hidden>
+      <thead><tr><th>Пресет</th><th>Вузлів</th><th>Напряму</th><th>Пакетів</th><th>Найкращий SNR</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+<section class="panel">
+    <h2>Канали</h2>
+    <form id="chan" class="row">
+      <input class="tg-input" id="curl" placeholder="https://meshtastic.org/e/#…" required autocomplete="off" style="flex:1;min-width:240px">
+      <label title="Як «Замінити» в застосунку: усі канали й налаштування LoRa беруться з посилання, вузол перезапуститься"><input type="checkbox" id="crep"> замінити всі</label>
+      <button class="check-btn">＋ Додати канал</button>
+    </form>
+    <p class="hint" style="margin-top:12px">Посилання — текст QR-коду каналу. Без «замінити всі» нові канали додаються як вторинні, наявні й налаштування радіо не змінюються.</p>
+  </section>
+  </div>
+  <div class="tabpane" data-tab="node" role="tabpanel" hidden>
+<section class="panel">
+    <h2>Вузол</h2>
+    <form id="name" class="row">
+      <label>Назва <input class="tg-input" id="long" maxlength="39" style="width:130px"></label>
+      <label title="до 4 байт (українська літера = 2 байти)">Коротка <input class="tg-input" id="short" maxlength="4" style="width:56px"></label>
+      <button class="check-btn">✓ Зберегти</button>
+      <button type="button" id="rs" class="reboot-btn">⟲ Перезапустити meshtasticd</button>
+      <button type="button" id="rb" class="reboot-btn">↻ Перезавантажити PI</button>
+      <button type="button" id="po" class="reboot-btn">⏻ Вимкнути PI</button>
+    </form>
+  </section>
+<section class="panel">
+    <h2>Розташування плати</h2>
+    <form id="locf" class="row">
+      <input class="tg-input" id="loc" placeholder="50.4501, 30.5234" autocomplete="off" style="flex:1;min-width:220px">
+      <button class="check-btn">✓ Зберегти</button>
+      <button type="button" id="locx" class="reboot-btn">✕ Очистити</button>
+    </form>
+    <p class="hint" style="margin-top:12px">Для колонки «Відстань» у таблиці вузлів. У Google Картах: правий клік по місцю → перший рядок меню — координати, клік копіює їх; можна вставити й посилання з «@широта,довгота». Зберігається лише на платі, в ефір не надсилається.</p>
+  </section>
+<section class="panel">
+    <h2>Автовідповідь</h2>
+    <form id="pongf" class="row">
+      <label><input type="checkbox" id="pong"> відповідати «Чую PING, відповідаю PONG, почув за N стрибків» на повідомлення «ping» або «пінг» (будь-яким регістром) від будь-кого</label>
+      <button class="check-btn">✓ Зберегти</button>
+    </form>
+    <p class="hint" style="margin-top:12px">Відповідь іде туди ж, звідки прийшов «ping» (у канал або особисто), не частіше ніж раз на 30 с одному вузлу. Стрибки — скільки ретрансляцій пройшов «ping» (0 — напряму).</p>
+  </section>
+<section class="panel">
+    <h2>Мелодія сповіщення</h2>
+    <form id="rtf" class="row">
+      <select class="tg-input" id="rtpre" title="Готові мелодії" style="width:130px">
+        <option value="">готові…</option>
+        <option>Dzvin:d=16,o=6,b=180:e,g,c7,8p,e,g,c7</option>
+        <option>Up:d=8,o=5,b=160:c,e,g,c6</option>
+        <option>Double:d=16,o=6,b=200:a,p,a,8p,a,p,a</option>
+        <option>Alarm:d=8,o=6,b=200:c,g5,c,g5,c,g5</option>
+        <option>PDA:d=16,o=6,b=225:b,b,g7,f#7,g7,b</option>
+      </select>
+      <input class="tg-input" id="rtttl" placeholder="назва:d=8,o=5,b=140:c,e,g,c6" autocomplete="off" spellcheck="false" style="flex:1;min-width:240px">
+      <button type="button" id="rtplay" class="check-btn">▶ Прослухати</button>
+      <button class="check-btn">✓ Зберегти</button>
+      <button type="button" id="rtx" class="reboot-btn">✕ Простий сигнал</button>
+    </form>
+    <p class="hint" style="margin-top:12px">Грає на головній сторінці на вхідне повідомлення, коли ввімкнено «🔔 сповіщати». Формат RTTTL, як у Meshtastic: <code>назва:d=тривалість,o=октава,b=темп:ноти</code>, нота — <code>[тривалість]нота[#][.][октава]</code>, пауза — <code>p</code>. Зберігається в цьому браузері.</p>
+  </section>
+  </div>
+  <div class="tabpane" data-tab="system" role="tabpanel" hidden>
+<section class="panel">
+    <h2>Журнал</h2>
+    <div class="row"><select class="tg-input" id="unit"><option>meshtasticd</option><option>meshpi-proxy</option><option>meshpi-web</option></select><button type="button" id="rl" class="check-btn">↻ Оновити</button></div>
+    <pre id="logtxt" style="max-height:390px;overflow:auto;margin-top:12px"></pre>
+  </section>
+<section class="panel">
+    <h2>Пароль</h2>
+    <form id="pw" class="row">
+      <input class="tg-input" id="pold" type="password" placeholder="Старий пароль" autocomplete="current-password" required>
+      <input class="tg-input" id="pnew" type="password" placeholder="Новий (8+ символів)" autocomplete="new-password" minlength="8" required>
+      <button class="check-btn">✎ Змінити пароль</button>
+    </form>
+    <form id="authf" class="row" style="margin-top:12px">
+      <label><input type="checkbox" id="noauth"> вхід без пароля</label>
+      <button class="check-btn">✓ Зберегти</button>
+    </form>
+    <p class="hint" style="margin-top:12px">Без пароля інтерфейс (і резервну копію з ключами каналів) може відкрити будь-хто в мережі плати. Пароль при цьому не стирається: повернути вхід за паролем — зняти позначку.</p>
+  </section>
+<section class="panel">
+    <h2>Резервна копія</h2>
+    <div class="row">
+      <button type="button" id="bk" class="check-btn">⬇ Завантажити копію</button>
+      <button type="button" id="rt" class="reboot-btn">⬆ Відновити з файлу</button>
+      <input type="file" id="rfile" accept=".json,application/json" hidden>
+    </div>
+    <p class="hint" style="margin-top:12px">У файлі: канали з ключами, назва вузла, історія повідомлень і графіків. Ключі каналів — секрет, зберігайте файл надійно. Відновлення замінює канали й історію; вузол перезапуститься.</p>
+  </section>
+  </div>
+</main>
+<footer class="hint foot">Meshpi © 2026 JunioR · ліцензія MIT</footer>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="/static/logic.js"></script>
+<script src="/static/common.js"></script>
+<script src="/static/tabs.js"></script>
+<script>(function () {  // сторінка «головна» (власна область видимості)
+
+
+let up = {raw: undefined, at: 0};  // останній час роботи від вузла (див. uptimeStr у logic.js)
+
+async function refreshStatus() {
+  const pill = $('#pill');
+  try {
+    const s = await api('/api/status');
+    $('#pilltxt').textContent = s.connected ? 'онлайн' : 'meshtasticd недоступний';
+    pill.className = 'status-pill ' + (s.connected ? 'online' : 'offline');
+    ring(s.connected);
+    if (!s.connected) return;
+    maxText = s.max_text;
+    if (JSON.stringify(s.home) !== JSON.stringify(home)) { home = s.home; renderNodes(); }
+    const m = s.metrics || {}, f = (v, u) => v == null ? '—' : [(+v).toFixed(1), u];
+    if (m.uptimeSeconds !== up.raw) up = {raw: m.uptimeSeconds, at: Date.now()};  // нове значення від вузла
+    metrics($('#stats'), [['Час роботи', uptimeStr(up.raw, up.at)],
+        ['Зайнятість каналу', ...f(m.channelUtilization, '%')],
+        ['Ефір TX', ...f(m.airUtilTx, '%')], ['Вузлів', s.node_count], txTile]);
+    myId = s.node.id;
+    $('#me').textContent = `${s.node.longName || '?'} (${s.node.shortName || '?'}) ${s.node.id || ''}`;  // підзаголовок шапки
+  } catch (e) { $('#pilltxt').textContent = e.message; pill.className = 'status-pill offline'; ring(false); }
+}
+
+// Фактична потужність на антені: «Final Tx power» із журналу (/api/power) + таблиця модуля; журнал читаємо раз на хвилину
+// Не вдалося порахувати (журнал без «Final Tx power», значення поза таблицею модуля) — показуємо останнє відоме;
+// воно пам'ятається в браузері, тож переживає й перезавантаження сторінки
+let txTile = ['Потужність на антені', '—'];
+try { txTile = JSON.parse(localStorage.getItem('anttile')) || txTile; } catch (e) { /* без сховища — «—» */ }
+async function refreshPower() {
+  try {
+    const p = await api('/api/power'), a = antennaPower(p.effective, p.radio), est = a?.est ? '≈' : '';
+    if (!a) return;
+    txTile = ['Потужність на антені', est + a.dbm, `дБм · ${est}${(a.mw / 1000).toFixed(2)} Вт`];
+    try { localStorage.setItem('anttile', JSON.stringify(txTile)); } catch (e) { /* ок */ }
+  } catch (e) { /* лишаємо попереднє */ }
+}
+
+async function refreshSystem() {
+  try {
+    const y = await api('/api/system'), h = await api('/api/health');
+    const n = (v, d = 0) => v == null ? '—' : (+v).toFixed(d);
+    const pct = (free, total) => free == null || !total ? '—' : (free / total * 100).toFixed(0);
+    metrics($('#sys'), [['Температура', n(y.temp, 1), '°C'], ['Процесор', n(y.cpu), '%'], ['Середнє навантаження', n(y.load, 2)],
+        ['Пам’ять вільна', pct(y.mem_free, y.mem_total), '%'], ['Диск вільний', pct(y.disk_free, y.disk_total), '%']]);
+    const hb = $('#health'); hb.replaceChildren();
+    for (const [k, ok] of [['/dev/spidev0.0', h.spi], ['сервіс meshtasticd: ' + (h.service || '?'), h.service === 'active'],
+        ['проксі API :4404', h.connected]]) {
+      const p = document.createElement('span'); p.className = 'badge ' + (ok ? 'state-idle' : 'state-reboot'); p.textContent = k; hb.append(p);
+    }
+    $('#errs').textContent = h.errors.join('\n');
+  } catch (e) { /* див. статус */ }
+}
+
+// Лінійний графік у SVG без бібліотек: pts = [[t, value], …]
+function chart(title, pts, unit) {
+  const NS = 'http://www.w3.org/2000/svg', W = 600, H = 90, el = (n, a) => {
+    const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  const box = document.createElement('div'), cap = document.createElement('small');
+  cap.style.color = 'var(--text-low)'; cap.style.fontFamily = 'var(--font-mono)';
+  const vals = pts.map(p => p[1]), max = Math.max(...vals, 1);
+  cap.textContent = pts.length ? `${title}: зараз ${vals[vals.length - 1].toFixed(1)}${unit}, макс ${max.toFixed(1)}${unit}` : `${title}: даних ще немає`;
+  box.append(cap);
+  if (pts.length > 1) {
+    const t0 = pts[0][0], span = (pts[pts.length - 1][0] - t0) || 1;
+    const svg = el('svg', {viewBox: `0 0 ${W} ${H}`, width: '100%', height: H, preserveAspectRatio: 'none'});
+    svg.append(el('polyline', {fill: 'none', stroke: 'var(--signal)', 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke',
+      points: pts.map(([t, v]) => `${((t - t0) / span * W).toFixed(1)},${(H - 4 - v / max * (H - 8)).toFixed(1)}`).join(' ')}));
+    box.append(svg);
+  }
+  return box;
+}
+
+async function refreshCharts() {
+  if (!$('#chartsbox').open) return;  // згорнуто — не вантажимо плату
+  try {
+    const h = await api('/api/history?hours=' + $('#hrs').value), box = $('#charts'); box.replaceChildren();
+    const col = k => h.filter(r => r[k] != null).map(r => [r.t, r[k]]);
+    box.append(chart('Зайнятість каналу', col('chan'), '%'), chart('Ефір TX', col('air'), '%'), chart('Вузлів', col('nodes'), ''));
+  } catch (e) { /* див. статус */ }
+}
+
+async function refreshLog() {
+  try { $('#logtxt').textContent = (await api('/api/log?unit=' + $('#unit').value)).text; }
+  catch (e) { $('#logtxt').textContent = e.message; }
+}
+
+let nodeList = [], favs = new Set();
+try { favs = new Set(JSON.parse(localStorage.getItem('favs') || '[]')); } catch (e) { /* без сховища — без обраних */ }
+const saveFavs = () => { try { localStorage.setItem('favs', JSON.stringify([...favs])); } catch (e) { /* ок */ } };
+
+const COLS = ['Назва', 'ID', 'SNR', 'RSSI', 'Стрибки', 'Координати', 'Довкілля', 'Відстань', 'Востаннє чутно'];
+let home = null, myId = null;  // «розташування плати» з налаштувань і ID свого вузла
+// Сортування кліком по заголовку; повторний клік — у зворотний бік; порожні значення завжди внизу
+let sortBy = {key: 'heard', dir: -1};
+try { sortBy = JSON.parse(localStorage.getItem('nodesort')) || sortBy; } catch (e) { /* типово — останні почуті вгорі */ }
+function sortMarks() {
+  for (const th of document.querySelectorAll('th[data-s]')) {
+    th.dataset.mark = th.dataset.s === sortBy.key ? (sortBy.dir > 0 ? ' ▲' : ' ▼') : '';
+    th.setAttribute('aria-sort', th.dataset.s === sortBy.key ? (sortBy.dir > 0 ? 'ascending' : 'descending') : 'none');
+  }
+}
+
+// Показники довкілля вузла, якщо він їх передає (дані з бази панелі: /api/nodes -> env)
+const ENVF = [['temperature', v => v.toFixed(1) + '°C'], ['humidity', v => Math.round(v) + '%'],
+  ['pressure', v => Math.round(v) + ' гПа'], ['iaq', v => 'IAQ ' + Math.round(v)], ['lux', v => Math.round(v) + ' лк'],
+  ['wind', v => v.toFixed(1) + ' м/с'], ['pm25', v => 'PM2.5 ' + Math.round(v)], ['co2', v => Math.round(v) + ' ppm']];
+function envStr(n) {
+  if (!n.env) return null;
+  const p = ENVF.filter(([k]) => n.env[k] != null).map(([k, f]) => f(+n.env[k]));
+  return p.length ? p.join(' · ') : null;
+}
+function renderNodes() {
+  const q = $('#q').value.trim().toLowerCase(), tb = $('#nodes'); tb.replaceChildren();
+  sortMarks();
+  for (const n of nodeList) n.dist = distance(n, home);
+  const age = +$('#age').value, now = Date.now() / 1000;
+  let shown = 0;
+  for (const n of sorted(nodeList, sortBy)) {
+    if (q && !`${n.long || ''} ${n.short || ''} ${n.id || ''}`.toLowerCase().includes(q)) continue;
+    if ($('#favonly').checked && !favs.has(n.id)) continue;
+    if ($('#pos').checked && (n.lat == null || n.lon == null)) continue;
+    if ($('#nomqtt').checked && n.mqtt && n.id !== myId && !favs.has(n.id)) continue;
+    // давно не чуті сховані (див. heardRecently)
+    if (!heardRecently(n, age, now, myId, favs)) continue;
+    shown++;
+    const tr = tb.insertRow();
+    const star = tr.insertCell(); star.textContent = favs.has(n.id) ? '★' : '☆'; star.style.cursor = 'pointer';
+    star.onclick = () => { favs.has(n.id) ? favs.delete(n.id) : favs.add(n.id); saveFavs(); renderNodes(); };
+    const pos = n.lat != null && n.lon != null ? `${n.lat.toFixed(4)}, ${n.lon.toFixed(4)}` : '—';
+    star.dataset.l = '★';
+    COLS.forEach((l, k) => {
+      const c = tr.insertCell(), v = [n.long || n.short, n.id, n.snr, n.rssi, n.hops, pos, envStr(n), distStr(n.dist), ago(n.heard)][k];
+      c.textContent = v ?? '—'; c.dataset.l = l;
+      if (k === 0 && n.id) { c.title = 'Написати цьому вузлу'; c.onclick = () => openConv(n.id); }
+      if (k === 1 && n.id) { c.title = 'Подробиці й запити до вузла'; c.onclick = () => openNode(n); }
+      if (k === 6 && n.env_t) c.title = 'Показники ' + ago(n.env_t) + ' тому';
+      if ((k === 2 || k === 3) && v != null) c.style.color = `var(--${quality(k === 2 ? SNR : RSSI, v)})`;
+    });
+  }
+  $('#ncount').textContent = shown < nodeList.length ? `показано ${shown} з ${nodeList.length}` : `усього ${shown}`;
+}
+
+let map, markers;
+function renderMap() {
+  if (typeof L === 'undefined') return;  // бібліотека не завантажилась — просто без карти
+  const pts = nodeList.filter(n => n.lat != null && n.lon != null);
+  $('#mapbox').hidden = !pts.length;
+  if (!pts.length) return;
+  const first = !map;
+  if (first) {
+    map = L.map('map');
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+    markers = L.layerGroup().addTo(map);
+  }
+  markers.clearLayers();
+  for (const n of pts) {
+    const el = document.createElement('div');  // елемент, а не рядок: назва вузла — чужі дані
+    const b = document.createElement('b'); b.textContent = n.long || n.short || n.id || '?';
+    el.append(b, document.createElement('br'), `${n.id || ''} · ${ago(n.heard)}`);
+    L.marker([n.lat, n.lon]).bindPopup(el).addTo(markers);
+  }
+  if (first) map.fitBounds(pts.map(n => [n.lat, n.lon]), {padding: [30, 30], maxZoom: 15});  // далі не збиваємо масштаб користувача
+}
+
+async function refreshNodes() {
+  try {
+    const list = await api('/api/nodes');
+    nodeList = list; renderNodes(); renderMap();
+    const to = $('#to'), cur = to.value;
+    to.replaceChildren(new Option('Усім', '^all'));
+    for (const n of list) if (n.id) to.append(new Option(n.long || n.id, n.id));
+    if (tab && ![...to.options].some(o => o.value === tab)) to.append(new Option(nameOf(tab), tab));  // розмова з вузлом поза списком
+    to.value = [...to.options].some(o => o.value === cur) ? cur : '^all';
+  } catch (e) { /* статус уже показує проблему */ }
+}
+
+// Подробиці вузла: запити в ефір (дані, маршрут, сигнал, показники) і їх результати
+let ndNode = null, ndTimer = null;
+const ERR = {NO_RESPONSE: 'вузол не відповів', MAX_RETRANSMIT: 'не доставлено', TIMEOUT: 'час вийшов', NO_ROUTE: 'немає маршруту'};
+const hopStr = h => h.map(x => (x.name || x.id) + (x.snr != null ? ` (${x.snr} дБ)` : '')).join(' → ');
+function askLines(r) {
+  const out = [], now = Date.now() / 1000;
+  for (const [k, title] of [['user', 'Дані'], ['trace', 'Маршрут'], ['signal', 'Сигнал'], ['device', 'Показники']]) {
+    const x = r[k];
+    if (!x) continue;
+    if (!x.done) { out.push(`${title}: ${now - x.sent > 60 ? 'немає відповіді' : `чекаю відповідь… ${now - x.sent | 0} с`}`); continue; }
+    if (!x.ok) { out.push(`${title}: ${ERR[x.error] || x.error}`); continue; }
+    if (k === 'trace' || k === 'signal') { out.push(probeLine(k, x)); continue; }
+    if (k === 'user') out.push(`Дані: ${x.data.long || '—'} (${x.data.short || '—'}), модель ${x.data.hw || '—'}, роль ${x.data.role}`);
+    if (k === 'device') {
+      const d = x.data, f = (v, u, n = 1) => v == null ? '—' : (+v).toFixed(n) + u;
+      out.push(`Показники: батарея ${bat(d.batteryLevel) ?? '—'}, напруга ${d.voltage > 0 ? f(d.voltage, ' В', 2) : '—'}, ` +
+        `канал ${f(d.channelUtilization, '%')}, ефір ${f(d.airUtilTx, '%')}, час роботи ${d.uptimeSeconds != null ? (d.uptimeSeconds / 3600).toFixed(1) + ' год' : '—'}`);
+    }
+  }
+  // збережені на платі 3 останні відповіді на «Маршрут» і «Сигнал» (крім щойно показаної)
+  for (const [k, title] of [['trace', 'Попередні маршрути'], ['signal', 'Попередні сигнали']]) {
+    const old = (r.history?.[k] || []).filter(x => x.done !== r[k]?.done);
+    if (old.length) out.push(`${out.length ? '\n' : ''}${title}:\n` + old.map(x => `  ${ago(x.done)} тому — ` + probeLine(k, x).replace(/\n/g, '\n    ')).join('\n'));
+  }
+  return out.join('\n') || 'Оберіть запит.';
+}
+function probeLine(k, x) {
+  if (!x.ok) return `${k === 'trace' ? 'Маршрут' : 'Сигнал'}: ${ERR[x.error] || x.error}`;
+  if (k === 'trace') return `Маршрут туди: ${hopStr(x.data.towards)}` + (x.data.back ? `\nМаршрут назад: ${hopStr(x.data.back)}` : '');
+  return `Сигнал відповіді: SNR ${x.snr ?? '—'} дБ, RSSI ${x.rssi ?? '—'} дБм, стрибків ${x.hops ?? '—'}`;
+}
+async function refreshAsk() {
+  if (!ndNode) return;
+  try {
+    const r = await api('/api/ask?to=' + encodeURIComponent(ndNode.id));
+    $('#ndout').textContent = askLines(r);
+    const busy = Object.entries(r).some(([k, x]) => k !== 'history' && !x.done && Date.now() / 1000 - x.sent < 65);
+    clearTimeout(ndTimer); if (busy) ndTimer = setTimeout(refreshAsk, 2000);
+  } catch (e) { $('#ndout').textContent = e.message; }
+}
+function openNode(n) {
+  ndNode = n; $('#nd').hidden = false;
+  $('#ndname').textContent = n.long || n.short || n.id; $('#ndid').textContent = n.id;
+  const info = ['модель ' + (n.hw && n.hw !== 'UNSET' ? n.hw : 'невідома')], dist = distStr(distance(n, home));
+  if (n.snr != null) info.push(`SNR ${n.snr} дБ`);
+  if (n.rssi != null) info.push(`RSSI ${n.rssi} дБм`);
+  if (n.hops != null) info.push(`стрибків ${n.hops}`);
+  if (n.heard) info.push(`чутно ${ago(n.heard)} тому`);
+  if (dist) info.push(dist);
+  const es = envStr(n); if (es) info.push(es);
+  $('#ndhw').textContent = info.join(' · ');
+  refreshAsk(); $('#nd').scrollIntoView({block: 'nearest'});
+}
+
+let msgs = [], seen = null, unread = 0;
+const nameOf = id => { const n = nodeList.find(x => x.id === id); return n ? n.long || n.short || id : id; };
+const sig = m => `${m.t}|${m.from}|${m.text}`;
+
+// Реакція: емодзі у відповідь на повідомлення — туди ж, куди воно прийшло (особисте — автору, у канал — у канал)
+const REACT = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🔥', '✅'];
+let pickFor = null;  // pid повідомлення з відкритим вибором емодзі (переживає перемальовування журналу)
+async function react(m, e) {
+  pickFor = null;
+  const to = dmPeer(m) || '^all';
+  try { await api('/api/send', {text: e, to, ch: m.ch, reply: m.pid, emoji: true}); await refreshMessages(); }
+  catch (err) { alert(err.message); }
+}
+function reactionChips(p, m, rs) {
+  for (const [e, r] of rs?.get(m.pid) || []) {
+    const s = document.createElement('span'); s.className = 'react'; s.title = r.who.join(', ');
+    s.textContent = r.n > 1 ? `${e} ${r.n}` : e; p.append(s);
+  }
+  if (!m.pid || m.emoji) return;
+  const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'react-btn'; btn.textContent = '☺';
+  btn.title = 'Відповісти емодзі'; btn.onclick = () => { pickFor = pickFor === m.pid ? null : m.pid; renderMessages(); };
+  const rb = document.createElement('button'); rb.type = 'button'; rb.className = 'react-btn'; rb.textContent = '↩';
+  rb.title = 'Відповісти з цитатою'; rb.onclick = () => startReply(m);
+  p.append(btn, rb);
+  if (pickFor !== m.pid) return;
+  const pick = document.createElement('span'); pick.className = 'react-pick';
+  for (const e of REACT) {
+    const x = document.createElement('button'); x.type = 'button'; x.textContent = e; x.onclick = () => react(m, e); pick.append(x);
+  }
+  p.append(pick);
+}
+
+// Відповідь із цитатою (reply_id, як «Відповісти» в застосунку): іде туди ж, куди прийшов оригінал, — як і реакція
+let replyTo = null;
+const replyDest = m => ({to: dmPeer(m) || '^all', ch: m.ch});
+function startReply(m) {
+  replyTo = m; const d = replyDest(m);
+  $('#replybar span').textContent = `↪ ${d.to === '^all' ? 'у канал ' + d.ch : 'особисто ' + nameOf(d.to)} · ${quoteText(m)}`;
+  $('#replybar').hidden = false; $('#text').focus();
+}
+function stopReply() { replyTo = null; $('#replybar').hidden = true; }
+$('#replybar button').onclick = stopReply;
+$('#text').addEventListener('keydown', e => { if (e.key === 'Escape' && replyTo) stopReply(); });
+
+function renderMessages() {
+  const box = $('#log'), stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.replaceChildren();
+  const list = msgs.filter(m => dmPeer(m) === tab), rs = reactionsOf(list);
+  const byPid = new Map(msgs.filter(m => m.pid && !m.emoji).map(m => [m.pid, m]));  // для цитат: з усіх, не лише розмови
+  for (const m of list) {
+    if (m.emoji && rs.has(m.reply)) continue;  // показана значком біля свого повідомлення
+    const dm = m.to && m.to !== '^all';  // приватне: адресоване одному вузлу (від нас або нам)
+    const p = document.createElement('p'); p.className = 'm' + (m.out ? ' out' : '') + (dm ? ' dm' : ''); if (m.pid) p.dataset.pid = m.pid;
+    const when = new Date(m.t * 1000).toLocaleTimeString();
+    const b = document.createElement('b'); b.textContent = m.name || m.from || '?';
+    if (!m.out && m.from) {  // клік по відправнику — подробиці вузла (як по ID у таблиці)
+      b.title = 'Інформація про вузол'; b.onclick = () => openNode(nodeList.find(x => x.id === m.from) || {id: m.from, long: m.name});
+    }
+    const meta = document.createElement('small');
+    // приватні — на своїй вкладці, тож ні «особисто», ні номера каналу не треба
+    meta.textContent = ' ' + [when, !dm && 'к' + m.ch, m.snr != null && 'SNR ' + m.snr, m.emoji && 'реакція'].filter(Boolean).join(' · ') + ': ';
+    p.append(b, meta);
+    if (m.reply && !m.emoji) {  // відповідь із цитатою: клік — до оригіналу
+      const q = document.createElement('span'), orig = byPid.get(m.reply); q.className = 'quote'; q.textContent = '↪ ' + quoteText(orig);
+      if (orig) {
+        q.title = 'Показати повідомлення';
+        q.onclick = () => { const t = box.querySelector(`p[data-pid="${m.reply}"]`); if (!t) return;
+          t.scrollIntoView({block: 'center', behavior: 'smooth'}); t.classList.add('flash'); setTimeout(() => t.classList.remove('flash'), 1500); };
+      }
+      p.append(q);
+    }
+    for (const [s, url] of linkParts(m.text || '')) {  // адреси в тексті — клікабельні, відкриваються в новій вкладці
+      if (!url) { p.append(s); continue; }
+      const a = document.createElement('a'); a.textContent = s; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.href = /^www\./i.test(s) ? 'https://' + s : s; p.append(a);
+    }
+    reactionChips(p, m, rs);
+    box.append(p);
+  }
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// Вкладки: «Канали» (повідомлення всім) і окремо кожна приватна розмова; лічильник — непрочитані вхідні
+let tab = '', tabSeen = null;  // tabSeen: вкладка → час останнього побаченого; null — ще не завантажено
+const opened = new Set();      // розмови, відкриті кліком по вузлу, поки без повідомлень
+let closed = {};               // закриті вкладки: ID → час останнього повідомлення на момент закриття (історія лишається)
+try { closed = JSON.parse(localStorage.getItem('closedtabs')) || {}; } catch (e) { /* без сховища — нічого не закрито */ }
+const saveClosed = () => { try { localStorage.setItem('closedtabs', JSON.stringify(closed)); } catch (e) { /* ок */ } };
+function renderTabs() {
+  const now = Math.max(0, ...msgs.map(m => m.t));
+  if (!tabSeen) tabSeen = new Map(['', ...dmTabs(msgs)].map(id => [id, now]));  // перше завантаження: уже прочитане
+  tabSeen.set(tab, now);
+  const bar = $('#tabs'); bar.replaceChildren();
+  for (const id of ['', ...shownTabs(msgs, [...opened, tab].filter(Boolean), closed)]) {
+    const b = document.createElement('button'), n = unreadIn(msgs, id, tabSeen.get(id) ?? 0);
+    b.type = 'button'; b.role = 'tab'; b.className = 'tab' + (id ? ' dm' : ''); b.ariaSelected = String(id === tab);
+    b.textContent = id ? '🔒 ' + nameOf(id) : 'Канали'; b.title = id ? 'Приватна розмова · ' + id : 'Повідомлення всім';
+    if (n) { const c = document.createElement('span'); c.className = 'count'; c.textContent = n; b.append(c); }
+    if (id) {  // × — закрити вкладку; історія лишається, нове повідомлення знову її відкриє
+      const x = document.createElement('span'); x.className = 'close'; x.textContent = '×'; x.title = 'Закрити вкладку (історія лишається)';
+      x.onclick = ev => { ev.stopPropagation(); closeTab(id); }; b.append(x);
+    }
+    b.onclick = () => openTab(id); bar.append(b);
+  }
+  $('#forget').hidden = !tab;
+}
+function closeTab(id) {
+  closed[id] = Math.max(0, ...msgs.filter(m => dmPeer(m) === id).map(m => m.t)); saveClosed(); opened.delete(id);
+  if (tab === id) openTab(''); else renderTabs();
+}
+$('#forget').onclick = async () => {
+  const id = tab;
+  if (!id || !confirm(`Видалити розмову з ${nameOf(id)} і всю її історію на платі? Відновити не можна.`)) return;
+  try { await api('/api/forget', {peer: id}); } catch (e) { alert(e.message); return; }
+  delete closed[id]; saveClosed(); opened.delete(id); openTab(''); refreshMessages();
+};
+function openTab(id) {
+  tab = id; stopReply(); $('#to').value = id || '^all';
+  renderTabs(); renderMessages();
+}
+function openConv(id) {  // клік по вузлу: приватна розмова з ним і він же адресат
+  opened.add(id); delete closed[id]; saveClosed(); openTab(id); $('#text').scrollIntoView({block: 'center'}); $('#text').focus();
+}
+
+const notifyOn = () => $('#notify').checked;
+function alertNew(list) {
+  if (document.hidden) { unread += list.length; document.title = `(${unread}) Meshpi`; }  // лічильник лише для фонової вкладки
+  chime();
+  if (document.hidden && window.Notification && Notification.permission === 'granted') {
+    const m = list[list.length - 1];
+    new Notification(m.name || m.from || 'Meshpi', {body: m.text});
+  }
+}
+
+let msgsRaw = '';
+async function refreshMessages() {
+  try {
+    msgs = await api('/api/messages');
+    const now = new Set(msgs.map(sig));
+    if (seen && notifyOn()) {
+      const fresh = msgs.filter(m => !m.out && !seen.has(sig(m)));
+      if (fresh.length) alertNew(fresh);
+    }
+    seen = now;
+    // перемальовуємо лише коли щось змінилось і поки не виділено текст у журналі — інакше виділення зникає щоразу за 3 с
+    const raw = JSON.stringify(msgs), sel = getSelection();
+    if (raw === msgsRaw || (sel && !sel.isCollapsed && $('#log').contains(sel.anchorNode))) return;
+    msgsRaw = raw; renderTabs(); renderMessages();
+  } catch (e) { /* див. статус */ }
+}
+
+// Ліміт сервера в БАЙТАХ (українська літера = 2 байти), тому maxlength у символах не підходить.
+let maxText = 200;  // уточнюється зі /api/status
+$('#text').addEventListener('input', e => {
+  const n = new TextEncoder().encode(e.target.value.trim()).length;
+  e.target.setCustomValidity(n > maxText ? `Забагато: ${n} байт із ${maxText} (українська літера = 2 байти, емодзі — 4 і більше)` : '');
+});
+
+// Емодзі в тексті: вставка в місце курсора; ліміт у байтах перевіряє обробник 'input' вище
+const EMO = '😀 😂 😊 😉 😍 😎 🤔 😮 😢 😡 👍 👎 👌 👋 🙏 💪 ❤️ 🔥 ⭐ ✅ ❌ ⚠️ ❓ 📡 📶 🔋 🛰️ 🏠 🚗 🌧️ ☀️ ☕'.split(' ');
+for (const e of EMO) {
+  const b = document.createElement('button'); b.type = 'button'; b.textContent = e;
+  b.onclick = () => {
+    const t = $('#text'), at = t.selectionStart ?? t.value.length;
+    t.setRangeText(e, at, t.selectionEnd ?? at, 'end'); t.dispatchEvent(new Event('input')); t.focus();
+  };
+  $('#emopanel').append(b);
+}
+$('#emo').onclick = () => {
+  const p = $('#emopanel'); p.hidden = !p.hidden; $('#emo').setAttribute('aria-expanded', String(!p.hidden));
+};
+
+$('#send').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  try {
+    const dest = replyTo ? replyDest(replyTo) : {to: $('#to').value, ch: +$('#ch').value};
+    await api('/api/send', {text: $('#text').value, ...dest, ...(replyTo && {reply: replyTo.pid})});
+    $('#text').value = ''; stopReply();
+    const t = dest.to === '^all' ? '' : dest.to;  // надіслане — у своїй вкладці: приватне видно в розмові
+    if (t !== tab) { opened.add(t); openTab(t); }
+    refreshMessages();
+  } catch (e) { alert(e.message); }
+});
+
+for (const id of ['#q', '#favonly', '#nomqtt', '#pos', '#age']) $(id).addEventListener('input', renderNodes);
+try { const m = localStorage.getItem('nomqtt'); if (m != null) $('#nomqtt').checked = m === '1'; } catch (e) { /* ок */ }
+$('#nomqtt').addEventListener('change', () => { try { localStorage.setItem('nomqtt', $('#nomqtt').checked ? '1' : '0'); } catch (e) { /* ок */ } });
+try { const a = localStorage.getItem('nodeage'); if (a != null) $('#age').value = a; } catch (e) { /* ок */ }
+$('#age').addEventListener('change', () => { try { localStorage.setItem('nodeage', $('#age').value); } catch (e) { /* ок */ } });
+for (const th of document.querySelectorAll('th[data-s]')) th.onclick = () => {
+  // спершу: назва й ID — за алфавітом, стрибки — найближчі, SNR/RSSI — найкращі, час — найсвіжіші
+  sortBy = sortBy.key === th.dataset.s ? {key: th.dataset.s, dir: -sortBy.dir} : {key: th.dataset.s, dir: ['name', 'id', 'hops', 'dist'].includes(th.dataset.s) ? 1 : -1};
+  try { localStorage.setItem('nodesort', JSON.stringify(sortBy)); } catch (e) { /* ок */ }
+  renderNodes();
+};
+for (const b of document.querySelectorAll('#nd [data-k]')) b.onclick = async () => {
+  try { await api('/api/ask', {to: ndNode.id, kind: b.dataset.k}); } catch (e) { alert(e.message); }
+  refreshAsk();
+};
+$('#ndx').onclick = () => { ndNode = null; clearTimeout(ndTimer); $('#nd').hidden = true; };
+try { $('#notify').checked = localStorage.getItem('notify') === '1'; } catch (e) { /* ок */ }
+$('#notify').onchange = () => {
+  try { localStorage.setItem('notify', notifyOn() ? '1' : '0'); } catch (e) { /* ок */ }
+  if (notifyOn()) {
+    try { audio = audio || new AudioContext(); } catch (e) { /* без звуку */ }
+    if (window.Notification && Notification.permission === 'default') Notification.requestPermission();
+  }
+};
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  unread = 0; document.title = 'Meshpi';
+  refreshStatus(); refreshNodes(); refreshMessages(); refreshSystem();
+});
+$('#hrs').onchange = refreshCharts;
+try { $('#chartsbox').open = localStorage.getItem('charts') !== '0'; } catch (e) { /* ок */ }
+$('#chartsbox').ontoggle = () => {
+  try { localStorage.setItem('charts', $('#chartsbox').open ? '1' : '0'); } catch (e) { /* ок */ }
+  refreshCharts();
+};
+$('#rl').onclick = refreshLog; $('#unit').onchange = refreshLog;
+
+refreshPower(); refreshStatus(); refreshNodes(); refreshMessages(); refreshSystem(); refreshLog(); refreshCharts();
+// У фонових вкладках опитування стоїть (менше навантаження на плату); лише повідомлення, якщо ввімкнено сповіщення, раз на 15 с.
+function every(fn, ms, bg) {
+  let n = 0;
+  setInterval(() => { if (!document.hidden || (bg && notifyOn() && ++n % 5 === 0)) fn(); }, ms);
+}
+every(refreshPower, 60000); every(refreshSystem, 10000); every(refreshCharts, 60000); every(refreshStatus, 5000); every(refreshNodes, 5000);
+every(refreshMessages, 3000, true);
+
+})();</script>
+<script>(function () {  // сторінка «налаштування» (власна область видимості)
+
+const fill = (sel, items, cur) => { for (const v of items) sel.append(new Option(v, v)); sel.value = cur; };
+
+async function refreshPower() {
+  try {
+    const p = await api('/api/power');
+    const f = v => v == null ? ['—'] : [v, 'дБм'];
+    metrics($('#pwr'), [['Задано', ...f(p.setting)], ['Після ліміту регіону', ...f(p.logged)],
+        ['Стеля чипа (конфіг)', ...f(p.cap)], ['Фактично на виході чипа', ...f(p.effective)],
+        ['Прошивка', p.patched ? 'змінена' : 'стандартна']]);
+    fillPowerTable(p.radio);
+    $('#cap').max = /ra-01|rfm98pw/i.test(p.radio || '') ? 20 : 22;  // SX1278 — до 20 дБм (raise-power.sh інакше відмовить)
+    if (+$('#cap').value > +$('#cap').max) $('#cap').value = $('#cap').max;
+    const t = antTable(p.radio);
+    $('#pwrnote').textContent = p.logged == null
+      ? 'У журналі meshtasticd ще немає рядка «Set radio» (він з’являється при старті радіо).'
+      : t ? `Модуль ${t.name} на антені видає більше, ніж на виході чипа (підсилювач модуля) — див. таблицю в блоці «Радіо».` : '';
+    // raise-power.sh утримує пакет (apt-mark hold): оновлення прошивки, зокрема безпеки, самі не приходять
+    $('#pkgnote').hidden = !p.held;
+    $('#pkgnote').textContent = `Оновлення meshtasticd заблоковано (змінена прошивка): встановлено ${p.installed || '?'}, ` +
+      `у репозиторії ${p.candidate || '?'}${p.candidate && p.candidate !== p.installed ? ' — є новіша' : ''}. ` +
+      'Щоб оновити: «Повернути стандартну», потім sudo apt update && sudo apt upgrade, потім знову «Зібрати й підняти стелю».';
+    $('#pb').disabled = $('#pr').disabled = p.running;
+    $('#pwrlog').textContent = p.running ? 'Збирання триває…\n' + p.log : p.log;
+    return p.running;
+  } catch (e) { return false; }
+}
+
+// рядки «Set radio» / «Final Tx power» з'являються в журналі лише після перезапуску радіо (~30 с) —
+// без цього блок показував би значення попереднього запуску
+const powerLater = () => setTimeout(refreshPower, 30000);
+function watchBuild() {  // оновлюємо блок, доки триває збирання, і ще раз після перезапуску meshtasticd
+  const t = setInterval(async () => { if (!await refreshPower()) { clearInterval(t); powerLater(); } }, 5000);
+}
+
+async function startBuild(target, q) {
+  if (!confirm(q)) return;
+  try { await api('/api/power-build', {target}); } catch (e) { alert(e.message); return; }
+  if (await refreshPower()) watchBuild();
+}
+
+async function doRestart(target, q) {
+  if (!confirm(q)) return;
+  try { await api('/api/restart', {target}); alert('Виконую…'); } catch (e) { alert(e.message); }
+}
+
+$('#radio').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (!confirm('Записати налаштування? Вузол перезапуститься, зв’язок зникне на кілька секунд.')) return;
+  try {
+    await api('/api/radio', {region: $('#region').value, preset: $('#preset').value, tx_power: +$('#tx').value, hop_limit: +$('#hop').value, channel_num: +$('#slot').value});
+    alert('Збережено. Вузол перезапускається.'); powerLater();
+  } catch (e) { alert(e.message); }
+});
+
+$('#name').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  try { await api('/api/name', {long: $('#long').value, short: $('#short').value}); alert('Збережено.'); }
+  catch (e) { alert(e.message); }
+});
+$('#pw').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  try {
+    await api('/api/password', {old: $('#pold').value, new: $('#pnew').value});
+    alert('Пароль змінено. Увійдіть заново.'); location.reload();
+  } catch (e) { alert(e.message); }
+});
+$('#pb').onclick = () => startBuild(String(+$('#cap').value),
+  'Перше збирання довге (повторне тієї ж версії — швидше, з кешу), потрібен інтернет і ~2 ГБ місця; наприкінці meshtasticd перезапуститься. Почати?');
+$('#pr').onclick = () => startBuild('restore', 'Повернути стандартний meshtasticd? Він перезапуститься.');
+$('#bk').onclick = () => { location.href = '/api/backup'; };
+$('#rt').onclick = () => $('#rfile').click();
+$('#rfile').onchange = async ev => {
+  const f = ev.target.files[0]; ev.target.value = '';
+  if (!f || !confirm('Відновити канали й історію з файлу «' + f.name + '»? Поточні канали й історія буде замінено.')) return;
+  try { await api('/api/restore', JSON.parse(await f.text())); alert('Відновлено. Вузол перезапускається.'); }
+  catch (e) { alert(e.message); }
+};
+$('#chan').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const replace = $('#crep').checked;
+  if (replace && !confirm('Замінити ВСІ канали й налаштування LoRa каналами з посилання? Вузол перезапуститься.')) return;
+  try {
+    const r = await api('/api/channel-url', {url: $('#curl').value.trim(), replace});
+    alert((r.added.length ? 'Додано: ' + r.added.join(', ') : 'Нічого не додано')
+      + (r.skipped.length ? '\nПропущено (вже є, без назви або немає вільних місць): ' + r.skipped.join(', ') : ''));
+    if (r.added.length) $('#curl').value = '';
+  } catch (e) { alert(e.message); }
+});
+api('/api/location').then(r => { if (r.home) $('#loc').value = `${r.home.lat}, ${r.home.lon}`; }).catch(() => {});
+$('#locf').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const p = parseLoc($('#loc').value);
+  if (!p) { alert('Не бачу координат. Приклад: 50.4501, 30.5234'); return; }
+  try { const r = await api('/api/location', p); $('#loc').value = `${r.home.lat}, ${r.home.lon}`; alert('Збережено.'); }
+  catch (e) { alert(e.message); }
+});
+// мелодія сповіщення: лише в цьому браузері (localStorage), грає головна сторінка (chime у common.js)
+try { $('#rtttl').value = localStorage.getItem('rtttl') || ''; } catch (e) { /* ок */ }
+const rtNotes = () => {
+  const r = parseRtttl($('#rtttl').value.trim());
+  if (!r) alert('Некоректний RTTTL. Приклад: назва:d=8,o=5,b=140:c,e,g,c6 (до 200 нот і 30 с)');
+  return r;
+};
+$('#rtpre').onchange = () => { if ($('#rtpre').value) { $('#rtttl').value = $('#rtpre').value; const r = rtNotes(); if (r) playNotes(r.notes); } };
+$('#rtplay').onclick = () => { const r = rtNotes(); if (r) playNotes(r.notes); };
+$('#rtf').addEventListener('submit', ev => {
+  ev.preventDefault();
+  const v = $('#rtttl').value.trim();
+  if (v && !rtNotes()) return;
+  try { v ? localStorage.setItem('rtttl', v) : localStorage.removeItem('rtttl'); alert('Збережено.'); }
+  catch (e) { alert('Браузер не дає зберегти (приватний режим?)'); }
+});
+$('#rtx').onclick = () => {
+  $('#rtttl').value = '';
+  try { localStorage.removeItem('rtttl'); } catch (e) { /* ок */ }
+  playNotes([{f: 880, ms: 150}]);
+};
+$('#authf').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const off = $('#noauth').checked;
+  if (off && !confirm('Вимкнути пароль? Інтерфейс зможе відкрити будь-хто в мережі плати.')) return;
+  try {
+    await api('/api/auth', {on: !off});
+    alert(off ? 'Пароль вимкнено.' : 'Пароль увімкнено — браузер попросить увійти.'); if (!off) location.reload();
+  } catch (e) { alert(e.message); }
+});
+$('#pongf').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  try { await api('/api/pong', {on: $('#pong').checked}); alert('Збережено.'); } catch (e) { alert(e.message); }
+});
+// таблиця потужності: підсвічуємо рядок значення з поля «Потужність»
+// таблиця — з logic.js (antTable), як і плитка на головній; будується під встановлений модуль
+const uk = v => String(v).replace('.', ',');
+let pwrMod;
+function fillPowerTable(radio) {
+  const t = antTable(radio), body = $('#pwrtab').tBodies[0];
+  if (t?.name === pwrMod) return;
+  pwrMod = t?.name; $('#pwrdet').hidden = !t; body.replaceChildren(); if (!t) return;
+  $('#pwrmod').textContent = t.name;
+  for (const th of document.querySelectorAll('#pwrtab th.meas')) th.hidden = !t.meas;
+  for (const h of document.querySelectorAll('#pwrdet [data-mod]')) h.hidden = h.dataset.mod !== t.name;
+  for (const [p, [dbm, mw, est]] of Object.entries(t.rows)) {
+    const tr = body.insertRow(), e = est ? '≈' : '';
+    tr.dataset.p = p; if (est) tr.className = 'est';
+    const m = t.meas?.[p];  // вимір власника для порівняння (є лише для частини рядків)
+    for (const v of [p, e + uk(dbm), e + mw]) tr.insertCell().textContent = v;
+    if (t.meas) { const c = tr.insertCell(); c.className = 'meas'; c.textContent = m ? `${uk(m[0])} / ${m[1]}` : '—'; }
+  }
+  markPower();
+}
+const markPower = () => { for (const tr of $('#pwrtab').tBodies[0].rows) tr.classList.toggle('cur', tr.dataset.p === $('#tx').value); };
+$('#tx').addEventListener('input', markPower);
+$('#locx').onclick = async () => {
+  try { await api('/api/location', {lat: null, lon: null}); $('#loc').value = ''; } catch (e) { alert(e.message); }
+};
+$('#rs').onclick = () => doRestart('meshtasticd', 'Перезапустити meshtasticd?');
+$('#rb').onclick = () => doRestart('board', 'Перезавантажити PI?');
+$('#po').onclick = () => doRestart('poweroff', 'Вимкнути PI? Увімкнути знову можна лише перепідключенням живлення.');
+
+async function loadSettings() {  // поля заповнюємо один раз
+  try {
+    const s = await api('/api/status');
+    $('#noauth').checked = s.auth === false;
+    if (!s.connected) { offline('meshtasticd недоступний — поля вузла й радіо порожні; оновіть сторінку, коли зв’язок відновиться.'); return; }
+    ring(true);
+    fill($('#region'), s.regions, s.region);
+    fill($('#preset'), s.presets, s.preset);
+    for (const p of s.presets) {
+      const l = document.createElement('label'), c = document.createElement('input');
+      c.type = 'checkbox'; c.value = p; c.checked = p === s.preset;
+      l.append(c, ' ' + p + (p === s.preset ? ' (поточний)' : '')); $('#scanpre').append(l);
+    }
+    $('#pong').checked = !!s.pong;
+    $('#long').value = s.node.longName || ''; $('#short').value = s.node.shortName || '';
+    $('#tx').value = s.tx_power; $('#hop').value = s.hop_limit || 3; $('#slot').value = s.channel_num || 0;
+    markPower();
+    if (s.override_frequency) {  // задано в застосунку: має перевагу над слотом, веб-форма її не змінює
+      $('#ovr').hidden = false;
+      $('#ovr').textContent = `Частоту перевизначено: ${s.override_frequency} МГц (задано в застосунку) — слот частоти не діє.`;
+    }
+  } catch (e) { offline(e.message); }
+}
+// --- пошук мережі за пресетами ---
+let scanTimer;
+const scanBusy = st => st === 'running' || st === 'restoring';
+function renderScan(sc) {
+  const busy = scanBusy(sc.state);
+  $('#scgo').hidden = busy; $('#scstop').hidden = !busy; $('#scstop').disabled = sc.state === 'restoring';
+  for (const c of document.querySelectorAll('#scanpre input, #dwell')) c.disabled = busy;
+  const msg = $('#scmsg'), tb = $('#sctab');
+  const text = {
+    running: sc.listening ? `Слухаю ${sc.presets[sc.cur]} (${sc.cur + 1} з ${sc.presets.length}), залишилось ${Math.max(0, Math.round(sc.ends - Date.now() / 1000))} с…` : `Перемикаю на ${sc.presets?.[sc.cur]} (${sc.cur + 1} з ${sc.presets?.length}), чекаю вузол…`,
+    restoring: 'Повертаю початковий пресет…',
+    done: 'Сканування завершено, початковий пресет повернуто.',
+    stopped: 'Зупинено, початковий пресет повернуто.',
+    error: sc.error,
+  }[sc.state];
+  msg.hidden = !text; msg.textContent = text || ''; msg.style.color = sc.state === 'error' ? 'var(--crit)' : '';
+  tb.hidden = !sc.results; if (!sc.results) return;
+  const rows = sc.presets.map(p => ({p, ...sc.results[p], n: Object.values(sc.results[p].nodes)}));
+  const best = rows.filter(r => r.n.length).sort((a, b) => b.n.length - a.n.length || b.packets - a.packets)[0];
+  tb.tBodies[0].replaceChildren(...rows.map(r => {
+    const tr = document.createElement('tr'), snr = r.n.map(x => x.snr).filter(x => x != null);
+    const cells = [r.p + (r === best && !scanBusy(sc.state) ? ' ★' : ''), r.n.length, r.n.filter(x => x.direct).length, r.packets, snr.length ? Math.max(...snr) + ' дБ' : '—'];
+    for (const v of cells) { const td = document.createElement('td'); td.textContent = v; tr.append(td); }
+    tr.title = r.n.map(x => x.name).join(', ');  // назви вузлів — підказкою
+    return tr;
+  }));
+}
+async function pollScan() {
+  try {
+    const sc = await api('/api/scan');
+    renderScan(sc);
+    if (scanBusy(sc.state)) { clearTimeout(scanTimer); scanTimer = setTimeout(pollScan, 2000); }
+  } catch (e) { scanTimer = setTimeout(pollScan, 5000); }  // під час перезапуску вузла веб відповідає, але на всяк випадок
+}
+$('#scgo').onclick = async () => {
+  const presets = [...document.querySelectorAll('#scanpre input:checked')].map(c => c.value);
+  if (!presets.length) { alert('Оберіть хоча б один пресет.'); return; }
+  if (!confirm('Почати сканування? Вузол не чутиме основну мережу, поки воно триває.')) return;
+  try { await api('/api/scan', {presets, dwell: +$('#dwell').value}); pollScan(); } catch (e) { alert(e.message); }
+};
+$('#scstop').onclick = async () => { try { await api('/api/scan', {stop: true}); } catch (e) { alert(e.message); } };
+function offline(text) { $('#offline').hidden = false; $('#offtxt').textContent = text; ring(false); }  // замість спливного вікна
+loadSettings().then(pollScan);
+refreshPower().then(running => { if (running) watchBuild(); });  // збирання могло почати раніше
+
+})();</script>
+<script src="/static/env.js"></script>
+</body>
+</html>

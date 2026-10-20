@@ -1,0 +1,9 @@
+# secrets and runtime data never go to git
+.env
+data/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+password
+__pycache__/

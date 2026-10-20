@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meshpi — вхід</title>
+<link rel="icon" href="data:,">
+<meta name="theme-color" content="#0b1220">
+<script>  // тема до відмальовування, щоб не було спалаху (як у style.css)
+  try { document.documentElement.dataset.theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); }
+  catch (e) { /* без сховища — темна */ }
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="login">
+  <form method="post" action="/login" class="panel login-box">
+    <div class="brand"><div class="ring"><span class="ring-dot"></span></div>
+      <div><h1>Meshpi</h1><p>Вхід до панелі</p></div></div>
+    {% if error %}<p class="login-err" role="alert">{{ error }}</p>{% endif %}
+    <input type="hidden" name="next" value="{{ next }}">
+    <label>Користувач
+      <input class="tg-input" name="user" autocomplete="username" value="{{ user }}" required autofocus></label>
+    <label>Пароль
+      <input class="tg-input" name="password" type="password" autocomplete="current-password" required></label>
+    <button class="check-btn login-go">Увійти</button>
+  </form>
+</main>
+</body>
+</html>

@@ -1,0 +1,23 @@
+services:
+  meshpi:
+    build: .
+    image: meshpi-web:local
+    container_name: meshpi
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file: .env                      # MESHPI_USER / MESHPI_PASSWORD (not in git, chmod 600)
+    environment:
+      MESH_HOST: 10.10.1.36             # Pi with the radio: mesh-proxy (multi-client), not meshtasticd directly
+      MESH_PORT: "4403"
+    ports:
+      - "10.10.92.30:8090:8080"         # bound to the LAN address only, 8088 is wg-manager
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
