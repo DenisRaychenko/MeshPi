@@ -365,6 +365,8 @@ ENV_DIGITS = {"temperature": 1, "humidity": 0, "pressure": 1, "iaq": 0, "gas": 1
 
 def record_env(packet):
     """Зберегти показники довкілля з пакета телеметрії (якщо це він і значення правдоподібні)."""
+    if packet.get("viaMqtt"):
+        return  # пакет прийшов через MQTT-міст, а не з радіоефіру
     dec = packet.get("decoded") or {}
     if dec.get("portnum") != "TELEMETRY_APP":
         return
@@ -401,8 +403,11 @@ def env_summary():
     now = int(time.time())
     i = iface
     hops_now = {(n.get("user") or {}).get("id"): n.get("hopsAway") for n in all_nodes(i)}
+    mqtt_ids = {(n.get("user") or {}).get("id") for n in all_nodes(i) if n.get("viaMqtt")}  # вузли лише через MQTT
 
     def hops_of(node, h):
+        if node in mqtt_ids:
+            return None
         h = h if h is not None else hops_now.get(node)
         return h if h is not None and h <= ENV_MAX_HOPS else None
 
@@ -513,7 +518,8 @@ def sample():
     try:
         with db_lock, db:
             db.execute("INSERT OR REPLACE INTO metric VALUES (?,?,?,?)",
-                       (now, m.get("channelUtilization"), m.get("airUtilTx"), len(all_nodes(i))))
+                       (now, m.get("channelUtilization"), m.get("airUtilTx"),
+                        sum(1 for n in all_nodes(i) if not n.get("viaMqtt"))))
             db.execute("DELETE FROM metric WHERE t < ?", (now - 7 * 86400,))
     except sqlite3.Error:
         log.exception("не вдалося записати метрики")
@@ -657,7 +663,7 @@ def status():
     lora = i.localNode.localConfig.lora
     return jsonify(
         connected=True, node=me.get("user", {}), metrics=me.get("deviceMetrics", {}),
-        hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=len(all_nodes(i)),
+        hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=sum(1 for n in all_nodes(i) if not n.get("viaMqtt")),
         region=_name(LoRa.RegionCode, lora.region), preset=_name(LoRa.ModemPreset, lora.modem_preset),
         tx_power=lora.tx_power, override_frequency=round(lora.override_frequency, 3), max_text=MAX_TEXT,
         home=home(), pong=Path(PONGFILE).exists(), auth=auth_on(),

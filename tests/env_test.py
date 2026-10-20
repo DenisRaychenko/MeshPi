@@ -37,6 +37,8 @@ m.record_env(pkt(1, {"temperature": 99.0}, hops=1))                      # rate-
 m.record_env(pkt(2, air={"pm25Standard": 12, "co2": 450}, hops=2))
 m.record_env({"from": 9, "fromId": "!00000009", "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "x"}})
 
+m.record_env(dict(pkt(1, {"temperature": 55.0}, hops=1), viaMqtt=True))        # MQTT-relayed packet: dropped
+m.record_env(pkt(6, {"temperature": 5.0}, hops=1))                              # node 6 is flagged viaMqtt in the node list
 rows = m.db.execute("SELECT node,k,v FROM env ORDER BY node,k").fetchall()
 check("garbage values rejected (node 5 has no rows)", not any(r[0] == "!00000005" for r in rows))
 check("rate limit keeps one temperature reading for node 1",
@@ -44,6 +46,7 @@ check("rate limit keeps one temperature reading for node 1",
 
 s = m.env_summary()
 by = {x["id"]: x for x in s["metrics"]}
+check("MQTT-flagged node does not enter the average (n stays 3)", by["temperature"]["n"] == 3)
 check("temperature = mean of nodes within 3 hops (20, 24, 22; 40 at 5 hops excluded)", by["temperature"]["avg"] == 22.0 and by["temperature"]["n"] == 3, str(by["temperature"]["avg"]))
 check("temperature min/max", (by["temperature"]["min"], by["temperature"]["max"]) == (20.0, 24.0))
 check("humidity = mean(50, 60)", by["humidity"]["avg"] == 55 and by["humidity"]["n"] == 2)
@@ -60,6 +63,6 @@ nl = {n["id"]: n for n in c.get("/api/nodes").get_json()}
 check("/api/nodes carries env values", nl["!00000001"]["env"]["temperature"] == 20.0 and nl["!00000001"]["env"]["pressure"] == 1010.0)
 check("/api/nodes env_t set", nl["!00000001"]["env_t"] >= now)
 check("library-remembered env used when DB has none", nl["!00000007"]["env"] == {"temperature": 18.5, "humidity": 40.0}, str(nl["!00000007"]["env"]))
-check("node without env has null", nl["!00000006"]["env"] is None)
+check("node without readings has null env", nl["!00000005"]["env"] is None)
 check("viaMqtt exposed as mqtt flag", nl["!00000006"]["mqtt"] is True and nl["!00000001"]["mqtt"] is False)
 sys.exit(0 if ok else 1)
