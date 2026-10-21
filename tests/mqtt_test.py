@@ -47,6 +47,12 @@ check("credentials never leave the server", "secret-user" not in dump and "secre
 check("modules not loaded yet -> None (no strip)", m.mqtt_info(ns(localNode=ns())) is None)
 check("no channels yet -> empty list, no crash", m.mqtt_info(node(False, channels=[]))["channels"] == [])
 
+page = m.app.test_client().get("/").get_data(as_text=True)
+a = page.index('class="tabpane" data-tab="nodes"')
+b = page.index('class="tabpane" data-tab="radio"')   # the pane after "nodes"
+check("MQTT strip sits on the Nodes tab", a < page.index('id="mqttstrip"') < b)
+check("and only once", page.count('id="mqttstrip"') == 1)
+
 m.init_db(m.DB_PATH)
 m.iface = ns(**{**node(True).__dict__, "nodesByNum": {}, "nodes": {}}, getMyNodeInfo=lambda: {"user": {"id": "!1"}, "deviceMetrics": {}})
 m.iface.localNode.localConfig = ns(lora=ns(hop_limit=5, channel_num=1, region=2, modem_preset=0, tx_power=10,
