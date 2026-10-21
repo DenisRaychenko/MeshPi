@@ -52,6 +52,9 @@ a = page.index('class="tabpane" data-tab="nodes"')
 b = page.index('class="tabpane" data-tab="radio"')   # the pane after "nodes"
 check("MQTT strip sits on the Nodes tab", a < page.index('id="mqttstrip"') < b)
 check("and only once", page.count('id="mqttstrip"') == 1)
+check("per-node 'Over MQTT' column exists and is sortable", '<th data-s="mqtt"' in page and "'MQTT', 'Востаннє чутно'" in page)
+check("the cell value follows the node flag", "n.mqtt ? 'так' : 'ні'" in page)
+check("node details say where the node was heard", "n.mqtt ? 'через MQTT' : 'з радіоефіру'" in page)
 
 m.init_db(m.DB_PATH)
 m.iface = ns(**{**node(True).__dict__, "nodesByNum": {}, "nodes": {}}, getMyNodeInfo=lambda: {"user": {"id": "!1"}, "deviceMetrics": {}})

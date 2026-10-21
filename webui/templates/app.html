@@ -88,7 +88,7 @@
       <span id="ncount" class="hint"></span>
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>★</th><th data-s="name">Назва</th><th data-s="id">ID</th><th data-s="snr">SNR</th><th data-s="rssi">RSSI</th><th data-s="hops">Стрибки</th><th>Координати</th><th>Довкілля</th><th data-s="dist" title="Від розташування, заданого в налаштуваннях">Відстань</th><th data-s="heard">Востаннє чутно</th></tr></thead>
+      <thead><tr><th>★</th><th data-s="name">Назва</th><th data-s="id">ID</th><th data-s="snr">SNR</th><th data-s="rssi">RSSI</th><th data-s="hops">Стрибки</th><th>Координати</th><th>Довкілля</th><th data-s="dist" title="Від розташування, заданого в налаштуваннях">Відстань</th><th data-s="mqtt" title="Вузол почуто через MQTT-міст, а не з радіоефіру (Over MQTT)">MQTT</th><th data-s="heard">Востаннє чутно</th></tr></thead>
       <tbody id="nodes"></tbody>
     </table></div>
     <div id="nd" hidden style="margin-top:16px;border-top:1px solid var(--line);padding-top:16px">
@@ -372,7 +372,7 @@ let nodeList = [], favs = new Set();
 try { favs = new Set(JSON.parse(localStorage.getItem('favs') || '[]')); } catch (e) { /* без сховища — без обраних */ }
 const saveFavs = () => { try { localStorage.setItem('favs', JSON.stringify([...favs])); } catch (e) { /* ок */ } };
 
-const COLS = ['Назва', 'ID', 'SNR', 'RSSI', 'Стрибки', 'Координати', 'Довкілля', 'Відстань', 'Востаннє чутно'];
+const COLS = ['Назва', 'ID', 'SNR', 'RSSI', 'Стрибки', 'Координати', 'Довкілля', 'Відстань', 'MQTT', 'Востаннє чутно'];
 let home = null, myId = null;  // «розташування плати» з налаштувань і ID свого вузла
 // Сортування кліком по заголовку; повторний клік — у зворотний бік; порожні значення завжди внизу
 let sortBy = {key: 'heard', dir: -1};
@@ -413,11 +413,12 @@ function renderNodes() {
     const pos = n.lat != null && n.lon != null ? `${n.lat.toFixed(4)}, ${n.lon.toFixed(4)}` : '—';
     star.dataset.l = '★';
     COLS.forEach((l, k) => {
-      const c = tr.insertCell(), v = [n.long || n.short, n.id, n.snr, n.rssi, n.hops, pos, envStr(n), distStr(n.dist), ago(n.heard)][k];
+      const c = tr.insertCell(), v = [n.long || n.short, n.id, n.snr, n.rssi, n.hops, pos, envStr(n), distStr(n.dist), n.mqtt ? 'так' : 'ні', ago(n.heard)][k];
       c.textContent = v ?? '—'; c.dataset.l = l;
       if (k === 0 && n.id) { c.title = 'Написати цьому вузлу'; c.onclick = () => openConv(n.id); }
       if (k === 1 && n.id) { c.title = 'Подробиці й запити до вузла'; c.onclick = () => openNode(n); }
       if (k === 6 && n.env_t) c.title = 'Показники ' + ago(n.env_t) + ' тому';
+      if (k === 8) { c.title = 'Over MQTT: ' + (n.mqtt ? 'так, вузол почуто через MQTT-міст' : 'ні, почуто з радіоефіру'); if (n.mqtt) c.style.color = 'var(--warn)'; }
       if ((k === 2 || k === 3) && v != null) c.style.color = `var(--${quality(k === 2 ? SNR : RSSI, v)})`;
     });
   }
@@ -508,6 +509,7 @@ function openNode(n) {
   if (n.heard) info.push(`чутно ${ago(n.heard)} тому`);
   if (dist) info.push(dist);
   const es = envStr(n); if (es) info.push(es);
+  info.push(n.mqtt ? 'через MQTT' : 'з радіоефіру');  // Over MQTT
   $('#ndhw').textContent = info.join(' · ');
   refreshAsk(); $('#nd').scrollIntoView({block: 'nearest'});
 }
