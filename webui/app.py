@@ -654,6 +654,21 @@ def set_pong():
     return jsonify(pong=on)
 
 
+def mqtt_info(i):
+    """MQTT на вузлі: чи ввімкнено модуль і які канали вивантажують/завантажують (прапорці каналів діють лише
+    при ввімкненому модулі). Логін і пароль до MQTT-сервера не віддаємо."""
+    try:
+        mq = i.localNode.moduleConfig.mqtt
+        chans = [{"index": c.index, "name": c.settings.name or f"канал {c.index}",
+                  "uplink": bool(c.settings.uplink_enabled), "downlink": bool(c.settings.downlink_enabled)}
+                 for c in (i.localNode.channels or []) if c.role != channel_pb2.Channel.DISABLED]
+        return {"enabled": bool(mq.enabled), "address": mq.address, "root": mq.root,
+                "proxy": bool(mq.proxy_to_client_enabled), "map": bool(mq.map_reporting_enabled),
+                "tls": bool(mq.tls_enabled), "json": bool(mq.json_enabled), "channels": chans}
+    except Exception:  # noqa: BLE001 — модулі ще не завантажені: просто без рядка MQTT
+        return None
+
+
 @app.get("/api/status")
 def status():
     i = iface
@@ -662,6 +677,7 @@ def status():
     me = i.getMyNodeInfo() or {}
     lora = i.localNode.localConfig.lora
     return jsonify(
+        mqtt=mqtt_info(i),
         connected=True, node=me.get("user", {}), metrics=me.get("deviceMetrics", {}),
         hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=sum(1 for n in all_nodes(i) if not n.get("viaMqtt")),
         region=_name(LoRa.RegionCode, lora.region), preset=_name(LoRa.ModemPreset, lora.modem_preset),

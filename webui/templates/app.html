@@ -38,6 +38,7 @@
   <div class="tabpane" data-tab="overview" role="tabpanel" hidden>
 <div id="stats" class="grid"></div>
 <div id="sys" class="grid"></div>
+<div class="strip" id="mqttstrip" hidden><span class="label">MQTT</span><span id="mqtttxt" class="row" style="gap:10px"></span></div>
 <section class="panel" id="envbox">
     <h2 id="envtitle">Довкілля</h2>
     <p id="envnote" class="hint" style="margin:0 0 12px"></p>
@@ -264,6 +265,25 @@
 
 let up = {raw: undefined, at: 0};  // останній час роботи від вузла (див. uptimeStr у logic.js)
 
+// MQTT на вузлі: модуль (enabled) і канали з вивантаженням/завантаженням. Прапорці каналів діють, лише коли модуль увімкнено.
+// Зелений «вимкнено» — трафік не виходить за межі радіомережі; бурштиновий «увімкнено» — виходить на сервер.
+function renderMqtt(m) {
+  const box = $('#mqttstrip'), txt = $('#mqtttxt');
+  box.hidden = !m;
+  if (!m) return;
+  const chip = (text, color) => { const s = document.createElement('span'); s.textContent = text; if (color) s.style.color = color; return s; };
+  const list = k => m.channels.filter(c => c[k]).map(c => c.name).join(', ') || 'жодного';
+  const parts = [chip(m.enabled ? 'увімкнено' : 'вимкнено', m.enabled ? 'var(--warn)' : 'var(--signal)')];
+  if (m.enabled) {
+    parts.push(chip(m.address || 'типовий сервер Meshtastic'));
+    if (m.root) parts.push(chip('тема ' + m.root));
+    parts.push(chip('через клієнта: ' + (m.proxy ? 'так' : 'ні')), chip('карта: ' + (m.map ? 'так' : 'ні')));
+  }
+  const note = chip(`вивантаження: ${list('uplink')} · завантаження: ${list('downlink')}` + (m.enabled ? '' : ' (діє лише при ввімкненому MQTT)'));
+  note.className = 'hint';
+  txt.replaceChildren(...parts, note);
+}
+
 async function refreshStatus() {
   const pill = $('#pill');
   try {
@@ -279,6 +299,7 @@ async function refreshStatus() {
     metrics($('#stats'), [['Час роботи', uptimeStr(up.raw, up.at)],
         ['Зайнятість каналу', ...f(m.channelUtilization, '%')],
         ['Ефір TX', ...f(m.airUtilTx, '%')], ['Вузлів', s.node_count], txTile]);
+    renderMqtt(s.mqtt);
     myId = s.node.id;
     $('#me').textContent = `${s.node.longName || '?'} (${s.node.shortName || '?'}) ${s.node.id || ''}`;  // підзаголовок шапки
   } catch (e) { $('#pilltxt').textContent = e.message; pill.className = 'status-pill offline'; ring(false); }
