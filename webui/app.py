@@ -121,6 +121,9 @@ def init_db(path):
     # показники довкілля від вузлів (телеметрія): одна точка на вузол і величину не частіше ENV_MIN_GAP
     db.execute("CREATE TABLE IF NOT EXISTS env (t INT, node TEXT, hops INT, k TEXT, v REAL)")
     db.execute("CREATE INDEX IF NOT EXISTS env_t ON env (t)")
+    # добовий архів зв'язків між вузлами (карта мережі): один рядок на добу й напрямок, лічильники пакетів
+    db.execute("CREATE TABLE IF NOT EXISTS link (day TEXT, src TEXT, dst TEXT, flow TEXT, kind TEXT, n INT,"
+               " snr_sum REAL, snr_n INT, t INT, PRIMARY KEY (day, src, dst, flow, kind))")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
     for c in ("pid INT", "reply INT", "emoji INT"):
@@ -485,8 +488,124 @@ def env_latest(nodes_list):
     return out
 
 
+# ---- карта мережі: хто кого чує ----
+# З кожного прийнятого пакета: відправник → ретранслятор → цей вузол (relayNode — лише останній байт id,
+# тож ретранслятора шукаємо серед відомих вузлів). З «Маршруту» — повний шлях туди (down) і назад (up);
+# з NeighborInfo — сусіди вузла. Напрямки відносно цього вузла (центр карти):
+#   up   — «вгору», до нас: те, що вузли передають нам (приймання, шлях назад);
+#   down — «вниз», від нас: те, що передаємо ми (шлях «туди» з перевірки маршруту).
+# kind: direct — пряме радіочуття; relay — ретранслятор, що передав чужий пакет нам; via — шлях через
+# невідомі проміжні вузли (пунктир).
+LINK_KEEP = 60 * 86400   # с: скільки тримати добовий архів
+LINK_FLUSH = 30          # с: зв'язки збираються в пам'яті й пишуться в базу пачкою (менше записів на диск)
+link_buf: dict[tuple, list] = {}  # (день, src, dst, flow, kind) -> [пакетів, сума SNR, кількість SNR, час]
+link_lock = threading.Lock()
+link_flushed = 0.0
+ROUTER_ROLES = {"ROUTER", "ROUTER_CLIENT", "ROUTER_LATE", "REPEATER"}
+
+
+def day_of(t=None):
+    return time.strftime("%Y-%m-%d", time.localtime(t))
+
+
+def node_id(num):
+    return f"!{num:08x}"
+
+
+def add_link(src, dst, flow, kind, snr=None, t=None):
+    if not src or not dst or src == dst:
+        return
+    t = int(t or time.time())
+    with link_lock:
+        e = link_buf.setdefault((day_of(t), src, dst, flow, kind), [0, 0.0, 0, t])
+        e[0] += 1
+        e[3] = t
+        if isinstance(snr, (int, float)) and not isinstance(snr, bool) and math.isfinite(snr):
+            e[1] += snr
+            e[2] += 1
+
+
+def flush_links(force=False):
+    global link_flushed
+    now = time.time()
+    if not force and now - link_flushed < LINK_FLUSH:
+        return
+    link_flushed = now
+    with link_lock:
+        items = list(link_buf.items())
+        link_buf.clear()
+    if not items:
+        return
+    try:
+        with db_lock, db:
+            for (day, a, b, flow, kind), (n, ssum, scnt, t) in items:
+                db.execute("INSERT INTO link VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (day, src, dst, flow, kind)"
+                           " DO UPDATE SET n = n + excluded.n, snr_sum = snr_sum + excluded.snr_sum,"
+                           " snr_n = snr_n + excluded.snr_n, t = MAX(t, excluded.t)",
+                           (day, a, b, flow, kind, n, ssum, scnt, t))
+            db.execute("DELETE FROM link WHERE t < ?", (int(now) - LINK_KEEP,))
+    except sqlite3.Error:
+        log.exception("не вдалося записати зв'язки між вузлами")
+
+
+def resolve_relay(i, byte, exclude):
+    """Вузол за останнім байтом id. Ретранслятор — наш прямий сусід: з кількох кандидатів беремо того, чий
+    hopsAway найменший, і лише якщо він один такий; невизначеність — None (краще без лінії, ніж хибна)."""
+    cands = [n for n in all_nodes(i) if isinstance(n.get("num"), int) and n["num"] & 0xFF == byte
+             and node_id(n["num"]) not in exclude and not n.get("viaMqtt")]
+    if not cands:
+        return None
+    best = min((n.get("hopsAway") if n.get("hopsAway") is not None else 99) for n in cands)
+    top = [n for n in cands if (n.get("hopsAway") if n.get("hopsAway") is not None else 99) == best]
+    return node_id(top[0]["num"]) if len(top) == 1 else None
+
+
+def record_link(packet, i):
+    """Зв'язки з прийнятого з ефіру пакета (див. вище)."""
+    if packet.get("viaMqtt") or i is None:
+        return
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
+    sender = sender_of(packet)
+    if not me or not sender or sender == me:
+        return
+    t, snr = packet.get("rxTime") or time.time(), packet.get("rxSnr")
+    dec = packet.get("decoded") or {}
+    if dec.get("portnum") == "NEIGHBORINFO_APP":  # вузол повідомляє, кого він сам чує
+        info = dec.get("neighborinfo") or dec.get("neighborInfo") or {}
+        for nb in info.get("neighbors") or []:
+            if isinstance(nb.get("nodeId"), int):
+                add_link(node_id(nb["nodeId"]), sender, "up", "direct", nb.get("snr"), t)
+    hs = packet.get("hopStart")
+    used = hs - (packet.get("hopLimit") or 0) if hs else None
+    byte = packet.get("relayNode")
+    if used == 0:
+        add_link(sender, me, "up", "direct", snr, t)
+        return
+    if not isinstance(byte, int):
+        return
+    relay = resolve_relay(i, byte, {me, sender})
+    if relay is None:
+        return
+    add_link(relay, me, "up", "relay", snr, t)
+    if used == 1:
+        add_link(sender, relay, "up", "direct", None, t)
+    elif used and used > 1:
+        add_link(sender, relay, "up", "via", None, t)
+
+
+def record_trace(data):
+    """Повний шлях з відповіді «Маршруту»: туди — «вниз», назад — «вгору»; кожен крок — пряме чуття."""
+    for key, flow in (("towards", "down"), ("back", "up")):
+        path = data.get(key) or []
+        for a, b in zip(path, path[1:]):
+            if a["id"] != "!ffffffff" and b["id"] != "!ffffffff":  # 0xffffffff — невідомий вузол на шляху
+                add_link(a["id"], b["id"], flow, "direct", b.get("snr"))
+
+
 def on_packet(packet, interface):
     _quiet(lambda: record_env(packet))
+    _quiet(lambda: record_link(packet, interface))
+    _quiet(flush_links)
     if packet.get("rxRssi") is not None and sender_of(packet):
         rssi[sender_of(packet)] = packet["rxRssi"]
     if scan.get("listening"):
@@ -529,6 +648,7 @@ def sampler():
     while True:
         time.sleep(SAMPLE_EVERY)
         _quiet(sample)
+        _quiet(flush_links)
 
 
 def connector():
@@ -1017,6 +1137,45 @@ def nodes():
     return unchanged_304(jsonify(out))
 
 
+@app.get("/api/mesh")
+def api_mesh():
+    """Граф мережі за добу (?day=РРРР-ММ-ДД, типово сьогодні) і перелік діб з даними."""
+    flush_links(True)
+    day = request.args.get("day") or day_of()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return err("day: РРРР-ММ-ДД")
+    with_mqtt = request.args.get("mqtt") == "1"
+    i = iface
+    with db_lock:
+        days = db.execute("SELECT day, SUM(n), COUNT(*) FROM link GROUP BY day ORDER BY day DESC").fetchall()
+        rows = db.execute("SELECT src, dst, flow, kind, n, snr_sum, snr_n, t FROM link WHERE day = ?", (day,)).fetchall()
+    known = {}
+    for n in all_nodes(i):
+        nid = (n.get("user") or {}).get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        if nid:
+            known[nid] = n
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    hidden = set() if with_mqtt else {nid for nid, n in known.items() if n.get("viaMqtt")}
+    links = [{"a": a, "b": b, "flow": flow, "kind": kind, "n": n, "t": t,
+              "snr": round(ss / sn, 1) if sn else None}
+             for a, b, flow, kind, n, ss, sn, t in rows if a not in hidden and b not in hidden]
+    ids = {x for l in links for x in (l["a"], l["b"])} | ({me} if me else set())
+    repeaters = {l["a"] for l in links if l["kind"] == "relay"} | {l["b"] for l in links if l["kind"] == "via"}
+    nodes = []
+    for nid in sorted(ids):
+        n = known.get(nid) or {}
+        u, p = n.get("user") or {}, n.get("position") or {}
+        role = u.get("role") or "CLIENT"
+        nodes.append({"id": nid, "name": u.get("longName") or nid, "short": u.get("shortName"), "role": role,
+                      "repeater": role in ROUTER_ROLES or nid in repeaters, "me": nid == me,
+                      "hops": n.get("hopsAway"), "mqtt": bool(n.get("viaMqtt")), "heard": n.get("lastHeard"),
+                      "lat": p.get("latitude"), "lon": p.get("longitude")})
+    mine = next((n for n in nodes if n["me"] and n["lat"] is not None and n["lon"] is not None), None)
+    origin = {"lat": mine["lat"], "lon": mine["lon"]} if mine else home()  # центр кілець відстані
+    return jsonify({"day": day, "today": day_of(), "me": me, "origin": origin, "nodes": nodes, "links": links,
+                    "days": [{"day": d, "packets": s, "links": c} for d, s, c in days]})
+
+
 # ---- запити до іншого вузла (як «Подробиці» в застосунку) ----
 ASK = {"user", "trace", "signal", "device"}
 ASK_GAP = 30  # с між однаковими запитами до вузла: ефір спільний
@@ -1075,6 +1234,8 @@ def ask():
         entry.update(ask_result(kind, p), done=time.time())
         if kind in PROBES:
             save_probe(to, kind, entry)
+        if kind == "trace" and entry.get("ok"):
+            _quiet(lambda: record_trace(entry["data"]))
 
     if kind == "user":
         me = (i.getMyNodeInfo() or {}).get("user", {})
