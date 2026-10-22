@@ -468,6 +468,28 @@
   }
   legend();
 
+  // автоматичні маршрути: перемикач і стан черги
+  const trace = $('#mtrace'), tstat = $('#mtstat');
+  async function loadTrace() {
+    try {
+      const r = await api('/api/autotrace');
+      trace.checked = r.on;
+      if (!r.on) { tstat.textContent = 'Авто-маршрути вимкнені.'; return; }
+      const parts = [`Авто-маршрути: раз на ${Math.round(r.every / 3600)} год і для нових вузлів, до ${r.max_hops} стрибків, по одному`];
+      if (r.current) parts.push(`зараз запитую ${nameOf(r.current)}`);
+      if (r.queued) parts.push(`у черзі ${r.queued}`);
+      if (r.next_cycle) parts.push(`наступне коло ${new Date(r.next_cycle * 1000).toLocaleTimeString('uk-UA', {hour: '2-digit', minute: '2-digit'})}`);
+      if (r.last) parts.push(`останній: ${r.last.name} ${r.last.ok ? '✓' : '✗ без відповіді'}`);
+      tstat.textContent = parts.join(' · ');
+    } catch (e) { tstat.textContent = e.message; }
+  }
+  trace.onchange = async () => {
+    try { await api('/api/autotrace', {on: trace.checked}); } catch (e) { tstat.textContent = e.message; }
+    loadTrace();
+  };
+
   load();
+  loadTrace();
+  setInterval(() => { if (!document.hidden) loadTrace(); }, 15000);
   setInterval(() => { if (!document.hidden && (!data || ui.day.value === data.today)) load(); }, 60000);
 })();

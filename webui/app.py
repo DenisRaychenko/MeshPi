@@ -1234,6 +1234,12 @@ def ask():
     prev = asked.get(to, {}).get(kind)
     if prev and time.time() - prev["sent"] < ASK_GAP:
         return err(f"Запит уже надіслано — повторити можна через {ASK_GAP} с", 429)
+    start_ask(i, to, kind)
+    return jsonify(ok=True)
+
+
+def start_ask(i, to, kind, done=None):
+    """Надіслати запит вузлу; відповідь запишеться в `asked` (і в архів зв'язків). done (Event) — подати, коли вона прийде."""
     if len(asked) >= 100 and to not in asked:  # пам'ять обмежена: забуваємо найстаріший вузол
         asked.pop(next(iter(asked)))
     entry = {"sent": time.time(), "done": None}
@@ -1245,6 +1251,8 @@ def ask():
             save_probe(to, kind, entry)
         if kind == "trace" and entry.get("ok"):
             _quiet(lambda: record_trace(entry["data"]))
+        if done:
+            done.set()
 
     if kind == "user":
         me = (i.getMyNodeInfo() or {}).get("user", {})
@@ -1257,7 +1265,7 @@ def ask():
             portnums_pb2.PortNum.TELEMETRY_APP
     i.sendData(data, destinationId=to, portNum=port, wantResponse=True, onResponse=on_response,
                hopLimit=i.localNode.localConfig.lora.hop_limit or 3)
-    return jsonify(ok=True)
+    return entry
 
 
 PROBES, PROBES_KEEP = ("trace", "signal"), 3  # які відповіді пам'ятати й скільки останніх на вузол
@@ -1284,6 +1292,105 @@ def ask_results():
     for k, res in rows:
         history[k].append(json.loads(res))
     return jsonify({**asked.get(to, {}), "history": history})
+
+
+# ---- автоматичні маршрути: «Маршрут» по черзі до вузлів раз на 3 год і для щойно з'явилися ----
+# Кожен запит — передача в ефір, тому: лише по одному (наступний — після відповіді або таймауту), з паузою між
+# ними, без MQTT-вузлів і лише до недавно чутих і близьких вузлів. Вимикається прапорцем на вкладці «Мережа».
+NOTRACEFILE = os.environ.get("MESHPI_NOTRACEFILE", str(Path(DB_PATH).with_name("notrace")))  # є файл — вимкнено
+TRACE_EVERY = int(os.environ.get("MESHPI_TRACE_EVERY", str(3 * 3600)))  # с між повними колами
+TRACE_WAIT = 150           # с чекати відповідь одного вузла, далі йдемо до наступного
+TRACE_PAUSE = 45           # с між запитами: ефір спільний
+TRACE_MAX_HOPS = int(os.environ.get("MESHPI_TRACE_HOPS", "5"))   # далі за стільки стрибків не питаємо
+TRACE_MAX_AGE = 86400      # с: питаємо лише вузли, чуті за останню добу
+trace_queue: collections.deque = collections.deque()
+trace_state: dict = {"current": None, "next_cycle": 0.0, "last": None, "seen": None}
+
+
+def trace_eligible(i):
+    """Вузли, яким має сенс слати «Маршрут»: радіо (не MQTT), не ми, близько, недавно чутні."""
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
+    now, out = time.time(), []
+    for n in all_nodes(i):
+        nid = (n.get("user") or {}).get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        hops = n.get("hopsAway")
+        if (not nid or nid == me or n.get("viaMqtt") or (hops is not None and hops > TRACE_MAX_HOPS)
+                or now - (n.get("lastHeard") or 0) > TRACE_MAX_AGE):
+            continue
+        out.append((hops if hops is not None else 99, -(n.get("lastHeard") or 0), nid))
+    return [nid for _h, _t, nid in sorted(out)]
+
+
+def trace_tick(i):
+    """Один крок планувальника: поповнити чергу (коло раз на TRACE_EVERY, нові вузли — першими)."""
+    now = time.time()
+    ids = trace_eligible(i)
+    everyone = {nid for nid in ids}
+    seen = trace_state["seen"]
+    if seen is None:  # перший запуск: вузли, що вже є, — не «нові»; перше коло через 2 хв
+        trace_state["seen"], trace_state["next_cycle"] = set(everyone), now + 120
+        return
+    for nid in ids:
+        if nid not in seen and nid not in trace_queue:
+            trace_queue.appendleft(nid)  # новий вузол — без черги
+    seen |= everyone
+    if now >= trace_state["next_cycle"]:
+        trace_state["next_cycle"] = now + TRACE_EVERY
+        trace_queue.extend(nid for nid in ids if nid not in trace_queue)
+
+
+def trace_one(i, nid):
+    done = threading.Event()
+    prev = asked.get(nid, {}).get("trace")
+    if prev and time.time() - prev["sent"] < ASK_GAP:
+        return  # щойно питали (наприклад, вручну)
+    trace_state["current"] = nid
+    try:
+        start_ask(i, nid, "trace", done)
+        ok = done.wait(TRACE_WAIT)
+    except Exception:  # noqa: BLE001 — збій відправки не зупиняє чергу
+        log.exception("автомаршрут до %s не надіслано", nid)
+        ok = False
+    finally:
+        trace_state["current"] = None
+    entry = asked.get(nid, {}).get("trace") or {}
+    trace_state["last"] = {"id": nid, "ok": bool(ok and entry.get("ok")), "t": int(time.time())}
+
+
+def autotrace():
+    while True:
+        time.sleep(15)
+        i = iface
+        if i is None or Path(NOTRACEFILE).exists() or scan["state"] in ("running", "restoring"):
+            continue
+        try:
+            trace_tick(i)
+            if trace_queue:
+                trace_one(i, trace_queue.popleft())
+                time.sleep(TRACE_PAUSE)
+        except Exception:  # noqa: BLE001
+            log.exception("збій планувальника автомаршрутів")
+
+
+@app.get("/api/autotrace")
+def get_autotrace():
+    last = trace_state["last"]
+    return jsonify(on=not Path(NOTRACEFILE).exists(), current=trace_state["current"], queued=len(trace_queue),
+                   next_cycle=int(trace_state["next_cycle"]) or None, every=TRACE_EVERY, max_hops=TRACE_MAX_HOPS,
+                   last=dict(last, name=node_name(iface, last["id"]) if iface else last["id"]) if last else None)
+
+
+@app.post("/api/autotrace")
+def set_autotrace():
+    on = body().get("on")
+    if not isinstance(on, bool):
+        return err("on: true або false")
+    if on:
+        Path(NOTRACEFILE).unlink(missing_ok=True)
+    else:
+        write_private(NOTRACEFILE, "")
+        trace_queue.clear()
+    return jsonify(on=on)
 
 
 @app.post("/api/forget")
@@ -1545,6 +1652,7 @@ if __name__ == "__main__":
     pub.subscribe(on_lost, "meshtastic.connection.lost")
     threading.Thread(target=connector, daemon=True).start()
     threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=autotrace, daemon=True).start()
     threading.Thread(target=scan_recover, daemon=True).start()
     # shortcut: HTTP без TLS; для доступу поза домашньою мережею — зворотний проксі з TLS (README, розділ 6)
     serve(app, host=os.environ.get("MESHPI_BIND", "0.0.0.0"), port=int(os.environ.get("MESHPI_PORT", "8080")),

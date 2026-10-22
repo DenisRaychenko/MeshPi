@@ -114,4 +114,44 @@ yday = m.day_of(now - 86400)
 m.add_link(ID(0x2B2), ID(0x1A1), "up", "direct", t=now - 86400)
 j3 = c.get(f"/api/mesh?day={yday}").get_json()
 check("yesterday is a separate day in the archive", len(j3["links"]) == 1 and {d["day"] for d in j3["days"]} >= {yday, m.day_of()})
+# automatic traceroutes: queue is filled by a 3-hour cycle and by newly seen nodes; one request at a time
+nodes[0x6C6] = dict(node(0x6C6, 6))                                   # too far (> 5 hops)
+nodes[0x6D6] = dict(node(0x6D6, 1), lastHeard=now - 3 * 86400)        # not heard for days
+m.trace_state.update(seen=None, next_cycle=0.0, current=None, last=None); m.trace_queue.clear()
+m.trace_tick(m.iface)
+check("first tick only seeds the known nodes and schedules the first cycle in ~2 min",
+      not m.trace_queue and m.trace_state["next_cycle"] > time.time() + 60 and len(m.trace_state["seen"]) == 5)
+nodes[0x7B7] = node(0x7B7, 1)
+m.trace_tick(m.iface)
+check("a node that appears later is queued at once", list(m.trace_queue) == [ID(0x7B7)])
+m.trace_state["next_cycle"] = 0.0
+m.trace_tick(m.iface)
+q = list(m.trace_queue)
+check("cycle queues every eligible node once, nearest first, new node not duplicated",
+      sorted(q) == sorted(ID(n) for n in (0x1A1, 0x6E6, 0x2B2, 0x3C3, 0x5A1, 0x7B7)) and len(q) == len(set(q)), str(q))
+check("MQTT-only, too far, stale and own node are never queued",
+      not {ID(0x4D4), ID(0x6C6), ID(0x6D6), ID(ME)} & set(q))
+check("next cycle scheduled 3 h ahead", m.trace_state["next_cycle"] > time.time() + 3 * 3600 - 60)
+
+order = []
+def fake_start(i, to, kind, done=None):
+    order.append(to); m.asked.setdefault(to, {})[kind] = {"sent": time.time(), "ok": True}
+    if to != ID(0x5A1):                                               # this one never answers
+        done.set()
+m.start_ask, m.TRACE_WAIT = fake_start, 0.2
+m.trace_one(m.iface, ID(0x2B2))
+check("answered trace is recorded as ok and clears the current target",
+      m.trace_state["last"]["id"] == ID(0x2B2) and m.trace_state["last"]["ok"] and m.trace_state["current"] is None)
+m.asked.pop(ID(0x5A1), None)
+t0 = time.time(); m.trace_one(m.iface, ID(0x5A1))
+check("silent node: waits only up to the timeout, then reports not ok", 0.15 < time.time() - t0 < 2 and not m.trace_state["last"]["ok"])
+m.trace_one(m.iface, ID(0x2B2))
+check("node asked a moment ago (manually) is not asked again", order == [ID(0x2B2), ID(0x5A1)], str(order))
+
+check("/api/autotrace on by default", c.get("/api/autotrace").get_json()["on"] is True)
+j = c.post("/api/autotrace", json={"on": False}).get_json()
+check("switching off clears the queue and persists", j["on"] is False and not m.trace_queue and os.path.exists(m.NOTRACEFILE)
+      and c.get("/api/autotrace").get_json()["on"] is False)
+check("switching on removes the flag file", c.post("/api/autotrace", json={"on": True}).get_json()["on"] and not os.path.exists(m.NOTRACEFILE))
+check("bad body rejected", c.post("/api/autotrace", json={"on": "yes"}).status_code == 400)
 sys.exit(0 if ok else 1)
