@@ -15,7 +15,7 @@
     get(k, d) { try { const v = localStorage.getItem('mesh_' + k); return v == null ? d : v; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem('mesh_' + k, v); } catch (e) { /* без сховища — ок */ } },
   };
-  const C = 450, MAXR = 420, HOME = {x: 0, y: 0, w: 900};
+  const C = 450, HOME = {x: 0, y: 0, w: 900};
   const ui = {day: $('#mday'), prev: $('#mprev'), next: $('#mnext'), via: $('#mvia'),
               mqtt: $('#mmqtt'), swap: $('#mswap'), reset: $('#mreset'), zin: $('#mzin'), zout: $('#mzout'), note: $('#mnote'), info: $('#minfo'),
               body: $('#mlinks'), legend: $('#mlegend')};
@@ -27,13 +27,13 @@
     if (!pts.length) return {...HOME};
     const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
     const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
-    const w = Math.min(HOME.w, Math.max(200, Math.max(x1 - x0, y1 - y0) + 120));  // поле під підписи
+    const w = Math.max(240, Math.max(x1 - x0, y1 - y0) + 300);  // поле під підписи, що виходять за вузли
     return {x: (x0 + x1) / 2 - w / 2, y: (y0 + y1) / 2 - w / 2, w};
   }
   const setView = () => svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.w}`);
   function zoomAt(fx, fy, f) {  // fx, fy — точка в частках вікна (0..1), яка лишається на місці
     auto = false;
-    const w = Math.min(1800, Math.max(80, view.w * f)), mx = view.x + fx * view.w, my = view.y + fy * view.w;
+    const w = Math.min(8000, Math.max(80, view.w * f)), mx = view.x + fx * view.w, my = view.y + fy * view.w;
     view = {x: mx - fx * w, y: my - fy * w, w};
     setView();
   }
@@ -55,7 +55,7 @@
   }
   const hasPos = n => n && typeof n.lat === 'number' && typeof n.lon === 'number' && !(n.lat === 0 && n.lon === 0);
   const fmtKm = d => d < 1 ? Math.round(d * 1000) + ' м' : d.toFixed(d < 10 ? 1 : 0) + ' км';
-  const nodeName = n => n.short || n.name || n.id;
+  const nodeName = n => n.name || n.short || n.id;
 
   // Стрибки вузла: з вузла (hopsAway), інакше з графа зв'язків — найкоротший шлях від нас мінус пряме чуття.
   function hopsMap(nodes, links, me) {
@@ -71,33 +71,100 @@
 
   // Кола — стрибки: 1…7 (hopsAway), прямі сусіди (0) — всередині першого кола. Кут — справжній азимут,
   // а без координат — стабільний за id.
+  // Щоб значки не налазили: радіус кола росте з кількістю вузлів на ньому, сусіди на колі розсуваються за кутом,
+  // а на щільному колі кожен другий зсунутий по радіусу (зигзаг).
+  const GAP = 46, RING_STEP = 90, TWO_PI = 2 * Math.PI;
   function layout(nodes, origin, hops) {
-    const S = MAXR / (RINGS + 1.4), pos = {};
-    let unknown = false;
+    const groups = new Map(), pos = {};
     for (const n of nodes) {
       if (n.me) { pos[n.id] = {x: C, y: C, dist: 0, th: 0, r: 0, brg: 0}; continue; }
-      const h = hops[n.id], known = origin && hasPos(n);
-      const r = h == null ? (RINGS + 0.9) * S : h === 0 ? 0.55 * S : Math.min(h, RINGS) * S;
-      if (h == null) unknown = true;
+      const h = hops[n.id], key = h == null ? 'x' : Math.min(h, RINGS), known = origin && hasPos(n);
+      if (!groups.has(key)) groups.set(key, []);
       const th = known ? bearing(origin, n) : hashAngle(n.id);
-      pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: known ? haversine(origin, n) : null, th, r, brg: th, hasBrg: !!known, hops: h};
+      groups.get(key).push({n, th, brg: th, dist: known ? haversine(origin, n) : null, hops: h});
     }
-    // розсуваємо накладені вузли вздовж кола (відстань від центру при цьому не міняється)
-    const list = Object.values(pos).filter(p => p.r > 0);
-    if (list.length < 300) {
-      for (let it = 0; it < 60; it++) {
+    const need = key => { const m = (groups.get(key) || []).length; return m * GAP / TWO_PI / (m > 6 ? 1.6 : 1); };
+    const R = {0: Math.max(60, need(0))};
+    for (let h = 1; h <= RINGS; h++) R[h] = Math.max(R[h - 1] + RING_STEP, need(h));
+    R.x = Math.max(R[RINGS] + RING_STEP, need('x'));
+    for (const [key, list] of groups) {
+      const r = R[key], m = list.length, min = Math.min(GAP / r * (m > 6 ? 0.62 : 1), TWO_PI / m);  // мін. кут між сусідами
+      for (let it = 0; it < 300 && m > 1; it++) {
+        for (const q of list) q.th = (q.th % TWO_PI + TWO_PI) % TWO_PI;
+        list.sort((a, b) => a.th - b.th);
         let moved = false;
-        for (let a = 0; a < list.length; a++) for (let b = a + 1; b < list.length; b++) {
-          const p = list[a], q = list[b], dx = q.x - p.x, dy = q.y - p.y, d = Math.hypot(dx, dy);
-          if (d >= 26) continue;
-          const push = (26 - d) / 2 / Math.max(p.r, q.r, 1) * (it % 2 ? -1 : 1) + 0.002;
-          p.th -= push; q.th += push; moved = true;
-          for (const z of [p, q]) { z.x = C + z.r * Math.sin(z.th); z.y = C - z.r * Math.cos(z.th); }
+        for (let i = 0; i < m; i++) {
+          const a = list[i], b = list[(i + 1) % m], d = b.th - a.th + (i === m - 1 ? TWO_PI : 0);
+          if (d < min - 1e-6) { const push = (min - d) / 2; a.th -= push; b.th += push; moved = true; }
         }
         if (!moved) break;
       }
+      list.sort((a, b) => a.th - b.th).forEach((q, i) => {
+        const rr = r + (m > 6 ? (i % 2 ? 9 : -9) : 0);
+        pos[q.n.id] = {x: C + rr * Math.sin(q.th), y: C - rr * Math.cos(q.th), dist: q.dist, th: q.th, r: rr, brg: q.brg, hops: q.hops};
+      });
     }
-    return {pos, S, hasUnknown: unknown};
+    return {pos, R, hasDirect: groups.has(0), hasUnknown: groups.has('x')};
+  }
+
+  // Ролі вузлів Meshtastic: підпис, колір і своя форма значка
+  const ROLES = {
+    CLIENT: ['Клієнт', '#8fa3c4'], CLIENT_MUTE: ['Клієнт Mute (не ретранслює)', '#7d8dab'],
+    CLIENT_HIDDEN: ['Клієнт прихований', '#7d8dab'], CLIENT_BASE: ['Базовий клієнт', '#5ec2e6'],
+    ROUTER: ['Роутер', '#ffb454'], ROUTER_CLIENT: ['Роутер-клієнт', '#ffb454'], ROUTER_LATE: ['Роутер (пізня ретрансляція)', '#ffb454'],
+    REPEATER: ['Репітер', '#ff8a3d'], TRACKER: ['Трекер', '#c77dff'], SENSOR: ['Датчик', '#4ade80'],
+    TAK: ['TAK', '#7bd88f'], TAK_TRACKER: ['TAK-трекер', '#7bd88f'], LOST_AND_FOUND: ['Загублені речі', '#ff7a90'],
+  };
+  const roleOf = n => ROLES[n.role] ? n.role : 'CLIENT';
+  const ROUTERISH = new Set(['ROUTER', 'ROUTER_CLIENT', 'ROUTER_LATE', 'REPEATER']);
+  const MQTT_COLOR = '#b07cff';
+  function icon(role, x, y) {
+    const c = ROLES[role][1], g = el('g'), add = (t, a) => g.append(el(t, a));
+    const solid = {fill: c}, ring = {fill: 'none', stroke: c, 'stroke-width': 2}, cut = 'var(--sky-900)';
+    const diamond = `M${x},${y - 10} L${x + 10},${y} L${x},${y + 10} L${x - 10},${y} Z`;
+    switch (role) {
+      case 'CLIENT_MUTE':
+        add('circle', {cx: x, cy: y, r: 8, ...ring}); add('line', {x1: x - 6, y1: y + 6, x2: x + 6, y2: y - 6, stroke: c, 'stroke-width': 2}); break;
+      case 'CLIENT_HIDDEN': add('circle', {cx: x, cy: y, r: 8, ...ring, 'stroke-dasharray': '3 2'}); break;
+      case 'CLIENT_BASE': add('path', {d: `M${x - 9},${y} L${x},${y - 9} L${x + 9},${y} L${x + 9},${y + 8} L${x - 9},${y + 8} Z`, ...solid}); break;
+      case 'ROUTER': add('path', {d: diamond, ...solid}); break;
+      case 'ROUTER_CLIENT': add('path', {d: diamond, ...solid}); add('circle', {cx: x, cy: y, r: 3, fill: cut}); break;
+      case 'ROUTER_LATE': add('path', {d: diamond, ...ring}); add('line', {x1: x - 4, y1: y, x2: x + 4, y2: y, stroke: c, 'stroke-width': 2}); break;
+      case 'REPEATER': add('polygon', {points: `${x - 5},${y - 9} ${x + 5},${y - 9} ${x + 10},${y} ${x + 5},${y + 9} ${x - 5},${y + 9} ${x - 10},${y}`, ...solid}); break;
+      case 'TRACKER':
+        add('path', {d: `M${x},${y + 11} C${x - 12},${y - 2} ${x - 8},${y - 11} ${x},${y - 11} C${x + 8},${y - 11} ${x + 12},${y - 2} ${x},${y + 11} Z`, ...solid});
+        add('circle', {cx: x, cy: y - 3, r: 3, fill: cut}); break;
+      case 'SENSOR':
+        add('rect', {x: x - 7, y: y - 7, width: 14, height: 14, rx: 2, ...solid});
+        add('polyline', {points: `${x - 4},${y + 1} ${x - 2},${y - 3} ${x},${y + 3} ${x + 2},${y - 3} ${x + 4},${y + 1}`, fill: 'none', stroke: cut, 'stroke-width': 1.5}); break;
+      case 'TAK': add('path', {d: `M${x - 8},${y - 8} H${x + 8} V${y + 2} L${x},${y + 10} L${x - 8},${y + 2} Z`, ...solid}); break;
+      case 'TAK_TRACKER': add('path', {d: `M${x - 8},${y - 8} H${x + 8} V${y + 2} L${x},${y + 10} L${x - 8},${y + 2} Z`, ...ring}); break;
+      case 'LOST_AND_FOUND': add('circle', {cx: x, cy: y, r: 9, ...ring}); add('circle', {cx: x, cy: y, r: 4, ...solid}); break;
+      default: add('circle', {cx: x, cy: y, r: 8, ...solid});
+    }
+    return g;
+  }
+  const isRelay = n => n.repeater && !ROUTERISH.has(roleOf(n));  // клієнт, що ретранслював пакети за даними
+
+  // легенда в лівому нижньому куті карти: лише те, що є на карті
+  function drawKey(nodes) {
+    const key = $('#mkey');
+    key.replaceChildren();
+    const items = [];
+    if (nodes.some(n => n.me)) items.push([() => el('circle', {cx: 0, cy: 0, r: 9, fill: 'var(--signal)'}), 'Цей вузол']);
+    for (const role of Object.keys(ROLES)) {
+      if (nodes.some(n => !n.me && roleOf(n) === role)) items.push([() => icon(role, 0, 0), ROLES[role][0]]);
+    }
+    if (nodes.some(n => !n.me && isRelay(n))) items.push([() => el('circle', {cx: 0, cy: 0, r: 10, fill: 'none', stroke: 'var(--warn)', 'stroke-width': 1.5}), 'Ретранслював пакети']);
+    if (nodes.some(n => n.mqtt)) items.push([() => el('circle', {cx: 0, cy: 0, r: 10, fill: 'none', stroke: MQTT_COLOR, 'stroke-width': 1.5, 'stroke-dasharray': '2 3'}), 'Через MQTT']);
+    key.hidden = !items.length;
+    for (const [make, label] of items) {
+      const row = document.createElement('div'), s = el('svg', {viewBox: '-13 -13 26 26', width: 18, height: 18});
+      row.style.cssText = 'display:flex;align-items:center;gap:6px;white-space:nowrap';
+      s.append(make());
+      const t = document.createElement('span'); t.textContent = label;
+      row.append(s, t); key.append(row);
+    }
   }
 
   function draw() {
@@ -106,6 +173,7 @@
     if (!data) return;
     const up = ui.swap.checked ? 'var(--signal)' : 'var(--crit)', down = ui.swap.checked ? 'var(--crit)' : 'var(--signal)';
     const showVia = ui.via.checked;
+    nextHop = buildRoutes();
     const L = layout(data.nodes, data.origin, hopsMap(data.nodes, data.links, data.me)), pos = L.pos;
     const defs = el('defs');
     for (const [id, col] of [['arUp', up], ['arDown', down]]) {
@@ -117,14 +185,13 @@
 
     // кола стрибків
     const g0 = el('g'); svg.append(g0);
-    for (let i = 1; i <= RINGS; i++) {
-      g0.append(el('circle', {cx: C, cy: C, r: i * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1}));
-      g0.append(el('text', {x: C + 4, y: C - i * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, `${i} ${hopWord(i)}`));
-    }
-    if (L.hasUnknown) {
-      g0.append(el('circle', {cx: C, cy: C, r: (RINGS + 0.9) * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-dasharray': '1 5'}));
-      g0.append(el('text', {x: C + 4, y: C - (RINGS + 0.9) * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, 'стрибки невідомі'));
-    }
+    const ringLine = (r, label, dash) => {
+      g0.append(el('circle', {cx: C, cy: C, r, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1, ...(dash ? {'stroke-dasharray': dash} : {})}));
+      g0.append(el('text', {x: C + 4, y: C - r - 3, fill: 'var(--text-low)', 'font-size': 12}, label));
+    };
+    if (L.hasDirect) ringLine(L.R[0], 'напряму', '2 5');
+    for (let i = 1; i <= RINGS; i++) ringLine(L.R[i], `${i} ${hopWord(i)}`);
+    if (L.hasUnknown) ringLine(L.R.x, 'стрибки невідомі', '1 5');
 
     // зв'язки: об'єднуємо різні види одного напрямку; пунктир — лише коли шлях іде через невідомі вузли
     const merged = new Map();
@@ -135,16 +202,24 @@
       if (m) { m.n += l.n; m.via = m.via && l.kind === 'via'; m.snr = m.snr ?? l.snr; } else merged.set(key, {...l, via: l.kind === 'via'});
     }
     const both = new Set([...merged.values()].map(l => `${l.a}|${l.b}`));
-    const gl = el('g'); svg.append(gl);
+    const gl = el('g'), gb = el('g'); svg.append(gl, gb);
+    const route = sel ? routeOf(sel) : null;  // шлях вибраного вузла до нас: його кроки яскраві й пронумеровані
+    const step = new Map((route || []).map((l, i) => [`${l.a}|${l.b}`, i + 1]));
     for (const l of merged.values()) {
       const p = pos[l.a], q = pos[l.b], dx = q.x - p.x, dy = q.y - p.y, len = Math.hypot(dx, dy) || 1;
       const off = both.has(`${l.b}|${l.a}`) || merged.has(`${l.b}|${l.a}|${l.flow === 'up' ? 'down' : 'up'}`) ? 7 : 0;
       const ux = dx / len, uy = dy / len, sx = p.x + ux * 12, sy = p.y + uy * 12, ex = q.x - ux * 15, ey = q.y - uy * 15;
       const cx = (sx + ex) / 2 - uy * off * 2, cy = (sy + ey) / 2 + ux * off * 2;
-      const dim = sel && l.a !== sel && l.b !== sel;
+      const hot = l.flow === 'up' && step.has(`${l.a}|${l.b}`), touch = l.a === sel || l.b === sel;
+      const opacity = !sel ? 0.75 : hot ? 1 : touch ? 0.45 : 0.06;
       const path = el('path', {d: `M${sx.toFixed(1)},${sy.toFixed(1)} Q${cx.toFixed(1)},${cy.toFixed(1)} ${ex.toFixed(1)},${ey.toFixed(1)}`,
-        fill: 'none', stroke: l.flow === 'up' ? up : down, 'stroke-width': (1.2 + Math.log2(l.n + 1) * 0.55).toFixed(1),
-        'stroke-opacity': dim ? 0.1 : 0.8, 'marker-end': `url(#${l.flow === 'up' ? 'arUp' : 'arDown'})`});
+        fill: 'none', stroke: l.flow === 'up' ? up : down, 'stroke-width': (1 + Math.log2(l.n + 1) * 0.4 + (hot ? 2 : 0)).toFixed(1),
+        'stroke-opacity': opacity, 'marker-end': `url(#${l.flow === 'up' ? 'arUp' : 'arDown'})`});
+      if (hot) {  // номер кроку на лінії маршруту
+        const bx = (sx + 2 * cx + ex) / 4, by = (sy + 2 * cy + ey) / 4;
+        gb.append(el('circle', {cx: bx, cy: by, r: 9, fill: 'var(--text-hi)'}));
+        gb.append(el('text', {x: bx, y: by + 4, 'text-anchor': 'middle', 'font-size': 11, 'font-weight': 700, fill: 'var(--sky-900)'}, step.get(`${l.a}|${l.b}`)));
+      }
       if (l.via) path.setAttribute('stroke-dasharray', '6 4');
       path.append(el('title', {}, `${nameOf(l.a)} → ${nameOf(l.b)} · ${l.flow === 'up' ? 'вгору' : 'вниз'} · ${l.n} пак.` +
         (l.snr != null ? ` · SNR ${l.snr}` : '') + (l.via ? ' · через невідомі вузли' : '')));
@@ -156,20 +231,23 @@
     for (const n of data.nodes) {
       const p = pos[n.id];
       if (!p) continue;
-      const g = el('g', {style: 'cursor:pointer', opacity: sel && !linked(n.id) ? 0.35 : 1});
-      const fill = n.me ? 'var(--signal)' : n.repeater ? 'var(--warn)' : 'var(--text-mid)';
-      if (n.repeater && !n.me) g.append(el('rect', {x: p.x - 8, y: p.y - 8, width: 16, height: 16, transform: `rotate(45 ${p.x} ${p.y})`, fill}));
-      else g.append(el('circle', {cx: p.x, cy: p.y, r: n.me ? 12 : 8, fill}));
+      const g = el('g', {style: 'cursor:pointer', opacity: sel && !linked(n.id) && !(route || []).some(l => l.a === n.id || l.b === n.id) ? 0.3 : 1});
+      if (n.me) g.append(el('circle', {cx: p.x, cy: p.y, r: 12, fill: 'var(--signal)'}));
+      else g.append(icon(roleOf(n), p.x, p.y));
+      if (!n.me && isRelay(n)) g.append(el('circle', {cx: p.x, cy: p.y, r: 14, fill: 'none', stroke: 'var(--warn)', 'stroke-width': 1.5}));
+      if (n.mqtt) g.append(el('circle', {cx: p.x, cy: p.y, r: 14, fill: 'none', stroke: MQTT_COLOR, 'stroke-width': 1.5, 'stroke-dasharray': '2 3'}));
       if (n.id === sel) g.append(el('circle', {cx: p.x, cy: p.y, r: 17, fill: 'none', stroke: 'var(--text-hi)', 'stroke-width': 2}));
-      const full = n.name || n.short || n.id;
-      g.append(el('text', {x: p.x, y: p.y + (n.me ? 25 : 21), 'text-anchor': 'middle', 'font-size': 11, fill: 'var(--text-hi)'},
-        full.length > 26 ? full.slice(0, 25) + '…' : full));
+      const full = n.name || n.short || n.id, text = full.length > 22 ? full.slice(0, 21) + '…' : full;
+      const right = p.x >= C;  // підпис йде від центру назовні, обведення фоном читається поверх ліній
+      g.append(el('text', {x: p.x + (n.me ? 0 : right ? 17 : -17), y: p.y + (n.me ? 27 : 4), 'text-anchor': n.me ? 'middle' : right ? 'start' : 'end',
+        'font-size': 12, fill: 'var(--text-hi)', stroke: 'var(--sky-900)', 'stroke-width': 3.5, 'stroke-linejoin': 'round', 'paint-order': 'stroke'}, text));
       g.addEventListener('pointerenter', ev => tip(n, p, ev));
       g.addEventListener('pointermove', ev => placeTip(ev));
       g.addEventListener('pointerleave', hideTip);
-      g.onclick = ev => { ev.stopPropagation(); sel = sel === n.id ? null : n.id; draw(); info(); };
+      g.onclick = ev => { ev.stopPropagation(); sel = sel === n.id ? null : n.id; draw(); info(); routeTable(); };
       gn.append(g);
     }
+    drawKey(data.nodes.filter(n => pos[n.id]));
     if (auto) view = fit(pos);
     setView();
     info.pos = pos;
@@ -188,7 +266,7 @@
     const deg = p.dist != null && !n.me ? ((p.brg * 180 / Math.PI) % 360 + 360) % 360 : null;
     const rows = [
       ['ID', n.id + (n.short ? ` · ${n.short}` : '')],
-      ['Роль', n.me ? 'цей вузол' : n.repeater ? 'ретранслятор' : n.role],
+      ['Роль', n.me ? 'цей вузол' : ROLES[roleOf(n)][0] + (ROLES[n.role] || !n.role ? '' : ` (${n.role})`) + (isRelay(n) ? ', ретранслював пакети' : '')],
       n.hw ? ['Плата', n.hw] : null,
       p.hops != null ? ['Стрибків', p.hops + (n.hops == null ? ' (за зв\'язками)' : '')] : null,
       p.dist != null && !n.me ? ['Відстань', `${fmtKm(p.dist)}, ${Math.round(deg)}° ${COMPASS[Math.round(deg / 45) % 8]}`] : null,
@@ -221,17 +299,60 @@
   const hideTip = () => { tipBox.style.display = 'none'; };
   svg.addEventListener('pointerleave', hideTip);
 
+  // Маршрут вузла до нас: найкоротший шлях за зв'язками «вгору»; серед рівних беремо той, де більше пакетів.
+  function buildRoutes() {
+    const radj = {}, next = {}, seen = {[data.me]: true}, queue = [data.me];
+    for (const l of data.links) if (l.flow === 'up' && (l.kind !== 'via' || ui.via.checked)) (radj[l.b] = radj[l.b] || []).push(l);
+    for (let i = 0; i < queue.length; i++) {
+      for (const l of (radj[queue[i]] || []).slice().sort((x, y) => y.n - x.n)) {
+        if (!seen[l.a]) { seen[l.a] = true; next[l.a] = l; queue.push(l.a); }
+      }
+    }
+    return next;
+  }
+  let nextHop = {};
+  function routeOf(id) {
+    const out = [], seen = new Set();
+    let cur = id;
+    while (cur !== data.me && nextHop[cur] && !seen.has(cur)) { seen.add(cur); out.push(nextHop[cur]); cur = nextHop[cur].b; }
+    return cur === data.me && out.length ? out : null;
+  }
+
   const nameOf = id => { const n = data && data.nodes.find(x => x.id === id); return n ? nodeName(n) : id; };
   const linked = id => id === sel || data.links.some(l => (l.a === sel && l.b === id) || (l.b === sel && l.a === id));
 
   function info() {
     const n = sel && data.nodes.find(x => x.id === sel);
-    if (!n) { ui.info.textContent = 'Натисніть вузол, щоб підсвітити його зв\'язки.'; return; }
+    ui.info.style.whiteSpace = 'pre-line';
+    if (!n) { ui.info.textContent = 'Натисніть вузол (на карті або в таблиці маршрутів), щоб підсвітити його шлях до нас.'; return; }
     const p = (info.pos || {})[n.id], mine = data.links.filter(l => l.a === n.id || l.b === n.id);
     const sum = f => mine.filter(f).reduce((s, l) => s + l.n, 0);
-    ui.info.textContent = `${n.name} · ${n.id} · ${n.repeater ? 'ретранслятор' : n.role}` +
+    const r = n.me ? null : routeOf(n.id);
+    ui.info.textContent = `${n.name} · ${n.id} · ${n.me ? 'цей вузол' : ROLES[roleOf(n)][0]}` +
       (n.hops != null ? ` · ${n.hops} стрибків` : '') + (p && p.dist != null ? ` · ${fmtKm(p.dist)} від нас` : ' · координат немає') +
-      ` · вгору ${sum(l => l.flow === 'up')} пак., вниз ${sum(l => l.flow === 'down')} пак.`;
+      ` · вгору ${sum(l => l.flow === 'up')} пак., вниз ${sum(l => l.flow === 'down')} пак.` +
+      (n.me ? '' : '\nМаршрут до нас: ' + (r ? routeText(r) : 'за даними цієї доби невідомий'));
+  }
+  const routeText = r => [r[0].a, ...r.map(l => l.b)].map(nameOf).join(' → ');
+
+  function routeTable() {
+    const body = $('#mroutes');
+    body.replaceChildren();
+    const rows = data.nodes.filter(n => !n.me).map(n => ({n, r: routeOf(n.id)}));
+    rows.sort((a, b) => (a.r ? a.r.length : 99) - (b.r ? b.r.length : 99) || (a.n.name || a.n.id).localeCompare(b.n.name || b.n.id));
+    for (const {n, r} of rows) {
+      const tr = body.insertRow();
+      tr.style.cursor = 'pointer';
+      if (n.id === sel) tr.style.background = 'var(--btn-signal-hover-bg)';
+      tr.onclick = () => { sel = sel === n.id ? null : n.id; draw(); info(); routeTable(); };
+      const name = tr.insertCell(); name.textContent = n.name || n.id;
+      tr.insertCell().textContent = r ? r.length : '—';
+      tr.insertCell().textContent = r ? routeText(r) : 'невідомий';
+      const weakest = r ? Math.min(...r.map(l => l.n)) : null;
+      tr.insertCell().textContent = r ? weakest : '—';
+      const snrs = r ? r.map(l => l.snr).filter(v => v != null) : [];
+      tr.insertCell().textContent = snrs.length ? Math.min(...snrs) : '—';
+    }
   }
 
   function table() {
@@ -279,7 +400,7 @@
         ? `${data.nodes.length} вузлів · ${data.links.length} напрямків зв'язку · ${pk} пакетів за ${r.day}.` +
           (data.origin ? '' : ' Задайте розташування в «Налаштуваннях» — тоді вузли стануть за справжньою відстанню.')
         : `За ${r.day} зв'язків ще немає: вони накопичуються з кожного прийнятого пакета.`;
-      draw(); info(); table();
+      draw(); info(); routeTable(); table();
     } catch (e) { ui.note.textContent = e.message; }
   }
 
@@ -299,7 +420,7 @@
     setView();
   });
   window.addEventListener('pointerup', () => { drag = null; });
-  svg.addEventListener('click', () => { if (sel && !(drag && drag.moved)) { sel = null; draw(); info(); } });
+  svg.addEventListener('click', () => { if (sel && !(drag && drag.moved)) { sel = null; draw(); info(); routeTable(); } });
 
   ui.reset.onclick = () => { auto = true; draw(); };
   ui.zin.onclick = () => zoomAt(0.5, 0.5, 0.7);
@@ -308,7 +429,7 @@
   ui.day.onchange = load;
   ui.prev.onclick = () => { ui.day.selectedIndex += 1; load(); };
   ui.next.onclick = () => { ui.day.selectedIndex -= 1; load(); };
-  ui.via.onchange = ui.swap.onchange = () => { store.set('via', ui.via.checked ? '1' : '0'); store.set('swap', ui.swap.checked ? '1' : '0'); legend(); draw(); table(); };
+  ui.via.onchange = ui.swap.onchange = () => { store.set('via', ui.via.checked ? '1' : '0'); store.set('swap', ui.swap.checked ? '1' : '0'); legend(); draw(); info(); routeTable(); table(); };
   ui.mqtt.onchange = () => { store.set('mqtt', ui.mqtt.checked ? '1' : '0'); load(); };
 
   function legend() {
@@ -318,7 +439,7 @@
       const s = document.createElement('span'); s.textContent = txt; s.style.color = col; ui.legend.append(s);
     }
     const t = document.createElement('span'); t.className = 'hint';
-    t.textContent = '◆ ретранслятор · ● вузол · пунктир — через невідомі вузли · товщина — кількість пакетів';
+    t.textContent = 'пунктирна лінія — через невідомі вузли · товщина — кількість пакетів · значки ролей — у куті карти';
     ui.legend.append(t);
   }
   legend();
