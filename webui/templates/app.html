@@ -111,6 +111,29 @@
     <h2>Карта (плитки — OpenStreetMap, потрібен інтернет у браузері)</h2>
     <div id="map" style="height:480px;border-radius:8px"></div>
   </section>
+<section id="wpbox" class="panel" hidden>
+    <h2>Точки на карті</h2>
+    <p class="hint" style="margin:0 0 10px">Клацніть на карті, щоб поставити точку, або змініть існуючу. Точка йде в ефір на вибраний канал, і її бачать усі
+      вузли цього каналу (як «Waypoint» у застосунку Meshtastic). Заблокована точка редагується лише її автором.</p>
+    <form id="wpform" class="row" style="gap:8px;align-items:flex-end">
+      <label>Назва <input class="tg-input" id="wpname" maxlength="30" placeholder="Місце збору" required autocomplete="off"></label>
+      <label>Опис <input class="tg-input" id="wpdescr" maxlength="100" placeholder="необов'язково" autocomplete="off"></label>
+      <label>Значок <input class="tg-input" id="wpicon" maxlength="4" value="📍" style="width:64px"></label>
+      <label>Широта <input class="tg-input" id="wplat" type="number" step="any" min="-90" max="90" required style="width:120px"></label>
+      <label>Довгота <input class="tg-input" id="wplon" type="number" step="any" min="-180" max="180" required style="width:120px"></label>
+      <label>Діє <select class="tg-input" id="wpttl"><option value="3600">1 год</option><option value="28800">8 год</option><option value="86400" selected>1 доба</option><option value="604800">1 тиждень</option><option value="0">без строку</option></select></label>
+      <label>Канал <input class="tg-input" id="wpch" type="number" min="0" max="7" value="0" style="width:64px"></label>
+      <label title="Лише ваш вузол зможе змінити чи видалити точку"><input type="checkbox" id="wplock"> заблокувати</label>
+      <button class="check-btn" id="wpgo">📤 Надіслати точку</button>
+      <button type="button" class="reboot-btn" id="wpcancel" hidden>Скасувати</button>
+    </form>
+    <div id="wpicons" class="row" style="gap:4px;margin-top:6px"></div>
+    <p id="wpmsg" class="hint" style="margin:6px 0 0"></p>
+    <div class="table-wrap" style="margin-top:10px"><table>
+      <thead><tr><th></th><th>Назва</th><th>Опис</th><th>Автор</th><th>Діє</th><th>Канал</th><th></th></tr></thead>
+      <tbody id="wprows"></tbody>
+    </table></div>
+  </section>
   </div>
   <div class="tabpane" data-tab="mesh" role="tabpanel" hidden>
 <section class="panel">
@@ -531,6 +554,8 @@ function renderMap() {
     map = L.map('map');
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
     markers = L.layerGroup().addTo(map);
+    window.meshMap = map;  // для точок на карті (waypoints.js)
+    window.dispatchEvent(new Event('meshmap'));
   }
   markers.clearLayers();
   for (const n of pts) {
@@ -1085,5 +1110,7 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/nodeactions.js"></script>
 <script src="/static/packets.js"></script>
 <script src="/static/quick.js"></script>
+<script src="/static/waypoints.js"></script>
+<script src="/static/nodecharts.js"></script>
 </body>
 </html>

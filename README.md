@@ -79,6 +79,7 @@ python tests/mesh_test.py webui     # зв'язки з пакетів, добо�
 python tests/multi_test.py webui    # кілька вузлів, міграція старої бази, дані окремо для кожного вузла
 python tests/admin_test.py webui    # адміністрування свого й віддаленого вузла (підставний вузол)
 python tests/features_test.py webui # статус доставки, позиція, готові повідомлення, QR, журнал пакетів
+python tests/waypoint_test.py webui # точки на карті (прийом, блокування, надсилання), телеметрія вузлів і /api/telemetry
 ```
 
 ## Обмеження в Docker

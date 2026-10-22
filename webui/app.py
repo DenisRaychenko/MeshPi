@@ -147,6 +147,12 @@ def init_db(path):
     # показники довкілля від вузлів (телеметрія): одна точка на вузол і величину не частіше ENV_MIN_GAP
     db.execute("CREATE TABLE IF NOT EXISTS env (t INT, node TEXT, hops INT, k TEXT, v REAL)")
     db.execute("CREATE INDEX IF NOT EXISTS env_t ON env (t)")
+    # телеметрія пристрою й живлення кожного вузла (батарея, напруга, зайнятість каналу, INA…): для графіків у панелі вузла
+    db.execute("CREATE TABLE IF NOT EXISTS tele (owner TEXT NOT NULL, node TEXT NOT NULL, t INT, k TEXT, v REAL)")
+    db.execute("CREATE INDEX IF NOT EXISTS tele_node ON tele (owner, node, t)")
+    # точки на карті (waypoints), прийняті з ефіру й надіслані нами; locked — номер вузла, якому належить редагування
+    db.execute("CREATE TABLE IF NOT EXISTS waypoint (owner TEXT NOT NULL, id INT NOT NULL, lat REAL, lon REAL, name TEXT,"
+               " descr TEXT, icon INT, expire INT, locked INT, sender TEXT, t INT, ch INT, PRIMARY KEY (owner, id))")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
     # ack: статус доставки приватного повідомлення — 0 надіслано, 1 хтось ретранслював, 2 дійшло до адресата, 3 помилка
@@ -670,6 +676,96 @@ def env_latest(nodes_list):
     return out
 
 
+# ---- телеметрія вузлів: історія для графіків ----
+TELE_KEEP = 7 * 86400
+TELE_MIN_GAP = 120  # с між точками однієї величини одного вузла
+# ключ у телеметрії -> (id серії, підпис, одиниця, допустимий діапазон)
+TELE_DEVICE = {
+    "batteryLevel": ("bat", "Батарея", "%", (0, 101)), "voltage": ("volt", "Напруга", "В", (0, 40)),
+    "channelUtilization": ("chan", "Зайнятість каналу", "%", (0, 100)), "airUtilTx": ("air", "Ефір TX", "%", (0, 100)),
+    "uptimeSeconds": ("up", "Час роботи", "год", (0, 10**9)),
+}
+TELE_POWER = {f"ch{n}{k}": (f"p{n}{s}", f"Канал {n}: {name}", unit, (-1e5, 1e5))  # INA219/226/260: до 3 каналів
+              for n in (1, 2, 3) for k, s, name, unit in (("Voltage", "v", "напруга", "В"), ("Current", "c", "струм", "мА"))}
+TELE_INFO = {v[0]: v for v in [*TELE_DEVICE.values(), *TELE_POWER.values()]}
+
+
+def record_tele(packet, owner=None):
+    """Зберегти показники пристрою й живлення з пакета телеметрії (точки не частіше TELE_MIN_GAP на величину й вузол)."""
+    owner = owner or cur_id()
+    dec = packet.get("decoded") or {}
+    if dec.get("portnum") != "TELEMETRY_APP" or packet.get("viaMqtt"):
+        return
+    tel, sender = dec.get("telemetry") or {}, sender_of(packet)
+    if not sender:
+        return
+    vals = []
+    for block, table in ((tel.get("deviceMetrics"), TELE_DEVICE), (tel.get("powerMetrics"), TELE_POWER)):
+        for key, (sid, _label, _unit, (lo, hi)) in table.items():
+            v = (block or {}).get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi:
+                vals.append((sid, float(v) / 3600 if sid == "up" else float(v)))
+    if not vals:
+        return
+    now = int(time.time())
+    try:
+        with db_lock, db:
+            for sid, v in vals:
+                last = db.execute("SELECT MAX(t) FROM tele WHERE owner = ? AND node = ? AND k = ?", (owner, sender, sid)).fetchone()[0]
+                if last and now - last < TELE_MIN_GAP:
+                    continue
+                db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES (?,?,?,?,?)", (owner, sender, now, sid, v))
+            db.execute("DELETE FROM tele WHERE t < ?", (now - TELE_KEEP,))
+    except sqlite3.Error:
+        log.exception("не вдалося записати телеметрію вузла")
+
+
+def thin(points, limit=240):
+    """Не більше limit точок: середнє по рівних відрізках часу (графік у браузері й так не покаже більше)."""
+    if len(points) <= limit:
+        return points
+    t0, t1 = points[0][0], points[-1][0]
+    step = max((t1 - t0) / limit, 1)
+    buckets: dict[int, list] = {}
+    for t, v in points:
+        buckets.setdefault(int((t - t0) / step), []).append((t, v))
+    return [[sum(t for t, _ in b) // len(b), sum(v for _, v in b) / len(b)] for _, b in sorted(buckets.items())]
+
+
+@app.get("/api/telemetry")
+def api_telemetry():
+    """Історія телеметрії вузла (?node=!id&hours=24): пристрій, живлення (INA) і довкілля; для вузла панелі ще й
+    зайнятість каналу, яку панель міряє сама."""
+    node = request.args.get("node", "")
+    try:
+        hours = min(max(int(request.args.get("hours", 24)), 1), 168)
+    except ValueError:
+        return err("hours: число")
+    if not re.fullmatch(r"![0-9a-f]{8}", node):
+        return err("node: !xxxxxxxx")
+    owner, since = cur_id(), int(time.time()) - hours * 3600
+    i = cur_iface()
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    with db_lock:
+        tele = db.execute("SELECT k, t, v FROM tele WHERE owner = ? AND node = ? AND t >= ? ORDER BY t", (owner, node, since)).fetchall()
+        env = db.execute("SELECT k, t, v FROM env WHERE owner = ? AND node = ? AND t >= ? ORDER BY t", (owner, node, since)).fetchall()
+        own = db.execute("SELECT t, chan, air FROM metric WHERE owner = ? AND t >= ? ORDER BY t", (owner, since)).fetchall() \
+            if node == me else []
+    series: dict[str, list] = {}
+    for k, t, v in [*tele, *env]:
+        series.setdefault(k, []).append([t, v])
+    if own and "chan" not in series:  # свій вузол: його власні виміри кожні 5 хв щільніші за телеметрію в ефірі
+        series["chan"] = [[t, c] for t, c, _a in own if c is not None]
+        series["air"] = [[t, a] for t, _c, a in own if a is not None]
+    info = {**TELE_INFO, **ENV_INFO}
+    out = []
+    for k in [*(v[0] for v in TELE_DEVICE.values()), *ENV_ORDER, *(v[0] for v in TELE_POWER.values())]:
+        pts = series.get(k)
+        if pts and k in info:
+            out.append({"id": k, "label": info[k][1], "unit": info[k][2], "points": thin(pts)})
+    return jsonify(node=node, hours=hours, series=out)
+
+
 # ---- карта мережі: хто кого чує ----
 # З кожного прийнятого пакета: відправник → ретранслятор → цей вузол (relayNode — лише останній байт id,
 # тож ретранслятора шукаємо серед відомих вузлів). З «Маршруту» — повний шлях туди (down) і назад (up);
@@ -831,6 +927,8 @@ def on_packet(packet, interface):
     owner = owner_of(interface)
     _quiet(lambda: log_packet(packet, owner))
     _quiet(lambda: record_env(packet, owner))
+    _quiet(lambda: record_tele(packet, owner))
+    _quiet(lambda: record_waypoint(packet, owner))
     _quiet(lambda: record_link(packet, interface))
     _quiet(flush_links)
     if packet.get("rxRssi") is not None and sender_of(packet):
@@ -1970,6 +2068,121 @@ def channel_qr():
     buf = io.BytesIO()
     segno.make(url, error="m").save(buf, kind="svg", scale=5, border=3, dark="#000000", light="#ffffff", xmldecl=False)
     return jsonify(url=url, qr="data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode())
+
+
+# ---- точки на карті (waypoints) ----
+# Точка — id, координати, назва, опис, значок-емодзі, строк дії (epoch; expire = 0 у пакеті означає «видалити»).
+# Приймаємо з ефіру, показуємо на карті у «Вузлах»; свої надсилаємо на вибраний канал. «locked» — номер вузла,
+# якому одному дозволено змінювати й видаляти точку (як у застосунку).
+WP_NEVER = 2**31 - 1        # «без строку» (0 зарезервовано під видалення)
+WP_MAX = 200                # скільки точок тримати на підключення
+WP_ICON = 0x1F4CD           # 📍
+
+
+def wp_cleanup(owner, now):
+    db.execute("DELETE FROM waypoint WHERE owner = ? AND expire <= ?", (owner, now))
+    db.execute("DELETE FROM waypoint WHERE owner = ? AND id NOT IN (SELECT id FROM waypoint WHERE owner = ?"
+               " ORDER BY t DESC LIMIT ?)", (owner, owner, WP_MAX))
+
+
+def record_waypoint(packet, owner=None):
+    """Точка з ефіру: нова чи оновлення (лише від власника, якщо вона заблокована), expire = 0 — видалення."""
+    owner = owner or cur_id()
+    dec = packet.get("decoded") or {}
+    if dec.get("portnum") != "WAYPOINT_APP" or packet.get("viaMqtt"):
+        return
+    w, sender, snum = dec.get("waypoint") or {}, sender_of(packet), packet.get("from")
+    wid = w.get("id")
+    if not isinstance(wid, int) or not sender:
+        return
+    now, expire = int(time.time()), int(w.get("expire") or 0)
+    lat, lon = w.get("latitudeI"), w.get("longitudeI")
+    try:
+        with db_lock, db:
+            row = db.execute("SELECT locked FROM waypoint WHERE owner = ? AND id = ?", (owner, wid)).fetchone()
+            if row and row[0] and row[0] != snum:
+                return  # заблокована за іншим вузлом: чужі зміни ігноруємо
+            if expire == 0 or expire <= now:
+                db.execute("DELETE FROM waypoint WHERE owner = ? AND id = ?", (owner, wid))
+                return
+            if not isinstance(lat, int) or not isinstance(lon, int) or not (-900000000 <= lat <= 900000000 and -1800000000 <= lon <= 1800000000):
+                return
+            db.execute("INSERT OR REPLACE INTO waypoint (owner, id, lat, lon, name, descr, icon, expire, locked, sender, t, ch)"
+                       " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (owner, wid, lat / 1e7, lon / 1e7, str(w.get("name") or "")[:30], str(w.get("description") or "")[:100],
+                        int(w.get("icon") or 0), expire, int(w.get("lockedTo") or 0), sender, now, packet.get("channel") or 0))
+            wp_cleanup(owner, now)
+    except sqlite3.Error:
+        log.exception("не вдалося записати точку на карті")
+
+
+def wp_json(r, me_id, i):
+    wid, lat, lon, name, descr, icon, expire, locked, sender, t, ch = r
+    return {"id": wid, "lat": lat, "lon": lon, "name": name, "description": descr,
+            "icon": chr(icon) if 0x20 < icon <= 0x10FFFF and not 0xD800 <= icon < 0xE000 else chr(WP_ICON),
+            "expire": None if expire >= WP_NEVER else expire, "locked": bool(locked), "sender": sender,
+            "sender_name": node_name(i, sender) if i and sender else sender, "mine": sender == me_id, "t": t, "ch": ch}
+
+
+@app.get("/api/waypoints")
+def get_waypoints():
+    owner, now, i = cur_id(), int(time.time()), cur_iface()
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    with db_lock, db:
+        wp_cleanup(owner, now)
+        rows = db.execute("SELECT id, lat, lon, name, descr, icon, expire, locked, sender, t, ch FROM waypoint WHERE owner = ?"
+                          " ORDER BY t DESC", (owner,)).fetchall()
+    return jsonify([wp_json(r, me, i) for r in rows])
+
+
+@app.post("/api/waypoints")
+def post_waypoints():
+    """action: send {id?, name, description, icon, lat, lon, ttl (с; 0 — без строку), lock, ch} | delete {id}."""
+    d = body()
+    i = need()
+    owner, now = owner_of(i), int(time.time())
+    me = i.getMyNodeInfo() or {}
+    me_num, me_id = me.get("num"), (me.get("user") or {}).get("id")
+    action, wid = d.get("action"), d.get("id")
+    if action not in ("send", "delete"):
+        return err("action: send | delete")
+    if wid is not None and (type(wid) is not int or not 0 < wid < 2**32):
+        return err("id: число")
+    with db_lock:
+        row = db.execute("SELECT locked FROM waypoint WHERE owner = ? AND id = ?", (owner, wid)).fetchone() if wid else None
+    if row and row[0] and row[0] != me_num:
+        return err("Точка заблокована за іншим вузлом: змінити чи видалити її може лише він", 403)
+    w = mesh_pb2.Waypoint()
+    if action == "delete":
+        if not wid:
+            return err("id: число")
+        w.id, w.expire = wid, 0
+        i.sendData(w, "^all", portNum=portnums_pb2.PortNum.WAYPOINT_APP, wantAck=True, channelIndex=int(d.get("ch", 0)) % 8)
+        with db_lock, db:
+            db.execute("DELETE FROM waypoint WHERE owner = ? AND id = ?", (owner, wid))
+        return jsonify(ok=True)
+    try:
+        name, descr = str(d.get("name", "")).strip(), str(d.get("description", "")).strip()
+        lat, lon, ttl, ch = float(d["lat"]), float(d["lon"]), int(d.get("ttl", 0)), int(d.get("ch", 0))
+        icon = ord(str(d.get("icon") or chr(WP_ICON))[0])
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180) or not 0 <= ch <= 7 or not (ttl == 0 or 60 <= ttl <= 365 * 86400):
+            raise ValueError
+        if not name or len(name.encode()) > 30 or len(descr.encode()) > 100:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, OverflowError, UnicodeEncodeError):
+        return err("Точка: назва до 30 байт, опис до 100, координати, строк 0 (без) або від 60 с, канал 0..7")
+    wid = wid or secrets.randbelow(10**9 - 1) + 1  # як у бібліотеки: id точки, а не пакета
+    expire = WP_NEVER if ttl == 0 else now + ttl
+    w.id, w.latitude_i, w.longitude_i, w.expire, w.name, w.description, w.icon = wid, int(lat * 1e7), int(lon * 1e7), expire, name, descr, icon
+    if d.get("lock") is True and me_num:
+        w.locked_to = me_num
+    i.sendData(w, "^all", portNum=portnums_pb2.PortNum.WAYPOINT_APP, wantAck=True, channelIndex=ch)
+    with db_lock, db:
+        db.execute("INSERT OR REPLACE INTO waypoint (owner, id, lat, lon, name, descr, icon, expire, locked, sender, t, ch)"
+                   " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (owner, wid, int(lat * 1e7) / 1e7, int(lon * 1e7) / 1e7, name, descr, icon, expire,
+                                                         me_num if d.get("lock") is True and me_num else 0, me_id, now, ch))
+        wp_cleanup(owner, now)
+    return jsonify(id=wid)
 
 
 # ---- адміністрування вузлів (свого й віддалених по радіо) ----

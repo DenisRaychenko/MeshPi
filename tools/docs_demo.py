@@ -111,6 +111,8 @@ class DemoIface:
                 threading.Timer(1.5, onResponse, args=({"fromId": num, "decoded": {"portnum": "ROUTING_APP", "requestId": self._pid,
                                                                                      "routing": {"errorReason": "NONE"}}},)).start()
             return types.SimpleNamespace(id=self._pid)
+        if isinstance(p, mesh_pb2.Waypoint):  # точка на карті: підтвердження не потрібне
+            return None
         if isinstance(p, mesh_pb2.Position):  # запит позиції вузла
             if onResponse:
                 n = nodes.get(int(str(num).lstrip("!"), 16) if isinstance(num, str) else num, {})
@@ -186,6 +188,25 @@ with m.db_lock, m.db:
                     if base is not None:
                         m.db.execute("INSERT INTO env (t, node, hops, k, v) VALUES (?,?,?,?,?)",
                                      (t, n["user"]["id"], n["hopsAway"], k, base + {"temperature": 3, "humidity": 8, "pressure": 2}[k] * math.sin(x)))
+
+# телеметрія вузлів (батарея, напруга, канал, INA219 на роутері) і точки на карті
+with m.db_lock, m.db:
+    for n in NODES[1:8]:
+        for t in range(now - 86400, now, 1800):
+            x = (t - now) / 86400 * 2 * math.pi
+            nid = n["user"]["id"]
+            for k, v in (("bat", 62 + 30 * math.sin(x + n["num"] % 7)), ("volt", 3.9 + 0.25 * math.sin(x + n["num"] % 7)),
+                         ("chan", 6 + 4 * math.sin(2 * x + n["num"] % 5) + random.random()), ("air", 0.8 + 0.4 * math.sin(x))):
+                m.db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES ('main', ?, ?, ?, ?)", (nid, t, k, v))
+            if n["num"] == 0x2001:
+                m.db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES ('main', ?, ?, 'p1v', ?)", (nid, t, 5.0 + 0.1 * math.sin(3 * x)))
+                m.db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES ('main', ?, ?, 'p1c', ?)", (nid, t, 380 + 60 * math.sin(2 * x)))
+    for wid, (name, descr, icon, dlat, dlon, ttl, mine) in {9001: ("Місце збору", "Біля млина, о 18:00", "🚩", 0.012, 0.02, 7200, True),
+                                                            9002: ("Колодязь", "Чиста вода", "💧", -0.02, -0.015, None, False)}.items():
+        m.db.execute("INSERT INTO waypoint (owner, id, lat, lon, name, descr, icon, expire, locked, sender, t, ch)"
+                     " VALUES ('main', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0)",
+                     (wid, LAT + dlat, LON + dlon, name, descr, ord(icon), now + ttl if ttl else 2**31 - 1,
+                      f"!{ME:08x}" if mine else "!00002001", now - 600))
 
 # зв'язки для карти
 LINKS = [(0x2001, ME, "up", "relay", 120), (0x2002, ME, "up", "direct", 60), (0x200E, ME, "up", "direct", 35),
