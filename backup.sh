@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nightly backup of the panel on the Docker host: history/graphs DB, password hash, session key, .env.
+# Nightly backup of the panel on the Docker host: history/graphs DB, password hash, session key, node list, .env.
 # Keeps 14 days. Install the schedule once:   ./backup.sh --install-cron
 # Restore: stop the container, copy messages-*.db back to data/messages.db and the files from files-*.tgz, start it.
 set -euo pipefail
@@ -34,7 +34,7 @@ PY
 fi
 
 tar --ignore-failed-read -czf "$DEST/files-$stamp.tgz" .env docker-compose.yml \
-  data/password data/location.json data/secret.key data/noauth data/pong 2>/dev/null || true
+  data/password data/location.json data/secret.key data/noauth data/pong data/nodes.json data/notrace 2>/dev/null || true
 
 sync
 find "$DEST" -type f \( -name 'messages-*.db' -o -name 'files-*.tgz' \) -mtime +"$KEEP_DAYS" -delete
