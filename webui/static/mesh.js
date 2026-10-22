@@ -372,6 +372,7 @@
       c1.textContent = r ? routeText(r) : 'невідомий';
       c2.textContent = dn ? routeText(dn) : 'невідомий';
       c1.style.color = up(); c2.style.color = dn ? down() : 'var(--text-low)';
+      for (const c of [c1, c2]) { c.style.whiteSpace = 'normal'; c.style.minWidth = '200px'; }  // довгі шляхи переносяться, а не ховаються за прокруткою
       const weakest = r ? Math.min(...r.map(l => l.n)) : null;
       tr.insertCell().textContent = r ? weakest : '—';
       const snrs = r ? r.map(l => l.snr).filter(v => v != null) : [];
