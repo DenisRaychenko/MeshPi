@@ -17,9 +17,26 @@
   };
   const C = 450, MAXR = 420, HOME = {x: 0, y: 0, w: 900};
   const ui = {day: $('#mday'), prev: $('#mprev'), next: $('#mnext'), rings: $('#mrings'), via: $('#mvia'),
-              mqtt: $('#mmqtt'), swap: $('#mswap'), reset: $('#mreset'), note: $('#mnote'), info: $('#minfo'),
+              mqtt: $('#mmqtt'), swap: $('#mswap'), reset: $('#mreset'), zin: $('#mzin'), zout: $('#mzout'), note: $('#mnote'), info: $('#minfo'),
               body: $('#mlinks'), legend: $('#mlegend')};
   let data = null, sel = null, view = {...HOME};
+  let auto = true;  // автомасштаб: вмістити всі вузли; вимикається ручним масштабом чи зсувом, вмикається кнопкою «авто»
+
+  function fit(pos) {
+    const pts = Object.values(pos);
+    if (!pts.length) return {...HOME};
+    const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const w = Math.min(HOME.w, Math.max(200, Math.max(x1 - x0, y1 - y0) + 120));  // поле під підписи
+    return {x: (x0 + x1) / 2 - w / 2, y: (y0 + y1) / 2 - w / 2, w};
+  }
+  const setView = () => svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.w}`);
+  function zoomAt(fx, fy, f) {  // fx, fy — точка в частках вікна (0..1), яка лишається на місці
+    auto = false;
+    const w = Math.min(1800, Math.max(80, view.w * f)), mx = view.x + fx * view.w, my = view.y + fy * view.w;
+    view = {x: mx - fx * w, y: my - fy * w, w};
+    setView();
+  }
 
   ui.rings.value = store.get('rings', '1,3,5');
   for (const k of ['via', 'mqtt', 'swap']) ui[k].checked = store.get(k, k === 'via' ? '1' : '0') === '1';
@@ -152,7 +169,8 @@
       g.onclick = ev => { ev.stopPropagation(); sel = sel === n.id ? null : n.id; draw(); info(); };
       gn.append(g);
     }
-    svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.w}`);
+    if (auto) view = fit(pos);
+    setView();
     info.pos = pos;
   }
 
@@ -221,24 +239,25 @@
   // масштаб колесом і перетягування
   svg.addEventListener('wheel', ev => {
     ev.preventDefault();
-    const rc = svg.getBoundingClientRect(), f = ev.deltaY < 0 ? 0.85 : 1 / 0.85, w = Math.min(1800, Math.max(120, view.w * f));
-    const mx = view.x + (ev.clientX - rc.left) / rc.width * view.w, my = view.y + (ev.clientY - rc.top) / rc.height * view.w;
-    view = {x: mx - (mx - view.x) * w / view.w, y: my - (my - view.y) * w / view.w, w};
-    svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.w}`);
+    const rc = svg.getBoundingClientRect();
+    zoomAt((ev.clientX - rc.left) / rc.width, (ev.clientY - rc.top) / rc.height, ev.deltaY < 0 ? 0.85 : 1 / 0.85);
   }, {passive: false});
   let drag = null;
   svg.addEventListener('pointerdown', ev => { drag = {x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y, moved: false}; });
   window.addEventListener('pointermove', ev => {
     if (!drag) return;
     const rc = svg.getBoundingClientRect(), dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    if (Math.abs(dx) + Math.abs(dy) > 3) { drag.moved = true; auto = false; }
     view.x = drag.vx - dx / rc.width * view.w; view.y = drag.vy - dy / rc.height * view.w;
-    svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.w}`);
+    setView();
   });
   window.addEventListener('pointerup', () => { drag = null; });
   svg.addEventListener('click', () => { if (sel && !(drag && drag.moved)) { sel = null; draw(); info(); } });
 
-  ui.reset.onclick = () => { view = {...HOME}; draw(); };
+  ui.reset.onclick = () => { auto = true; draw(); };
+  ui.zin.onclick = () => zoomAt(0.5, 0.5, 0.7);
+  ui.zout.onclick = () => zoomAt(0.5, 0.5, 1 / 0.7);
+  ui.day.addEventListener('change', () => { auto = true; });  // інша доба — знову вмістити все
   ui.day.onchange = load;
   ui.prev.onclick = () => { ui.day.selectedIndex += 1; load(); };
   ui.next.onclick = () => { ui.day.selectedIndex -= 1; load(); };
