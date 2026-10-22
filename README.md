@@ -51,6 +51,7 @@ Telegram-мосту: проксі роздає потік вузла кільк�
 | `webui/admin.py` | керування вузлами: розділи конфігурації, канали, позиція, дії; свій вузол і віддалені по радіо |
 | `webui/templates/app.html` | єдина сторінка з вкладками; `login.html`: сторінка входу |
 | `webui/static/` | `tabs.js` (вкладки), `env.js` (довкілля), `mesh.js` (карта мережі), `logic.js`, `common.js`, `style.css` |
+| `telegram-bot/` | Telegram-міст для Meshtastic (працює на Pi як служба `mesh-telegram`): код, інсталятор, опис |
 | `docs/` | `INSTALL.md`: встановлення; `WEB-PANEL.md`: опис можливостей з картинками (`docs/img/`) |
 | `Dockerfile`, `docker-compose.yml` | образ без root, файлова система лише для читання, ліміт 256 МБ |
 | `backup.sh` | нічна копія бази й налаштувань (14 діб) |
