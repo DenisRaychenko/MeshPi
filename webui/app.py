@@ -455,6 +455,19 @@ def all_nodes(i):
     return list((getattr(i, "nodesByNum", None) or {}).values()) if i else []
 
 
+_JSON_TYPES = (str, int, float, bool, dict, list, tuple)
+
+
+def plain(x):
+    """Лише те, що серіалізується в JSON. Бібліотека кладе в словники вузлів і сирі protobuf-об'єкти (ключ «raw»,
+    з'являється, щойно вузол отримав власний NodeInfo чи телеметрію), а jsonify на них падає з 500."""
+    if isinstance(x, dict):
+        return {k: plain(v) for k, v in x.items() if k != "raw" and (v is None or isinstance(v, _JSON_TYPES))}
+    if isinstance(x, (list, tuple)):
+        return [plain(v) for v in x if v is None or isinstance(v, _JSON_TYPES)]
+    return x
+
+
 def node_name(interface, node_id):
     user = ((interface.nodes or {}).get(node_id) or {}).get("user", {})
     return user.get("longName") or node_id
@@ -1109,7 +1122,7 @@ def status():
     return jsonify(
         conn=cur_id(), conns=[c.public() for c in conns.values()],
         mqtt=mqtt_info(i),
-        connected=True, node=me.get("user", {}), metrics=me.get("deviceMetrics", {}),
+        connected=True, node=plain(me.get("user", {})), metrics=plain(me.get("deviceMetrics", {})),
         hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=sum(1 for n in all_nodes(i) if not n.get("viaMqtt")),
         region=_name(LoRa.RegionCode, lora.region), preset=_name(LoRa.ModemPreset, lora.modem_preset),
         tx_power=lora.tx_power, override_frequency=round(lora.override_frequency, 3), max_text=MAX_TEXT,

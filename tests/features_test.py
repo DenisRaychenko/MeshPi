@@ -149,6 +149,17 @@ check("packet log: hops, relay, name, mqtt flag", rows[0]["mqtt"] and rows[1]["h
 check("packet log: encrypted packet has no portnum", rows[0]["port"] == "ЗАШИФРОВАНО" and rows[1]["port"] == "TEXT_MESSAGE_APP")
 check("packet log is per connection", m.pkt_log.keys() == {"main"} and c.get("/api/packets?limit=x").status_code == 400)
 
+# ---- /api/status не падає, коли бібліотека поклала у вузол сирі protobuf-об'єкти ----
+fi.nodesByNum[ME]["user"]["raw"] = mesh_pb2.User(long_name="Me")
+fi.nodesByNum[ME]["deviceMetrics"] = {"batteryLevel": 80, "raw": mesh_pb2.User()}
+r = c.get("/api/status")
+sj = r.get_json()
+check("/api/status survives raw protobuf objects in the node info", r.status_code == 200 and sj["node"].get("longName") == "Me" and "raw" not in sj["node"]
+      and sj["metrics"] == {"batteryLevel": 80}, str(r.status_code))
+check("plain() drops raw protobufs recursively and keeps JSON values", m.plain({"a": 1, "raw": mesh_pb2.User(), "b": {"raw": 1, "c": [1, mesh_pb2.User(), "x"]}, "u": mesh_pb2.User()})
+      == {"a": 1, "b": {"c": [1, "x"]}})
+del fi.nodesByNum[ME]["user"]["raw"]
+
 # ---- прапорці вузлів ----
 nl = {n["id"]: n for n in c.get("/api/nodes").get_json()}
 check("/api/nodes: favourite, ignored, muted flags and role", nl[PEER_ID]["fav"] and not nl[PEER_ID]["ignored"] and nl[PEER_ID]["muted"] and nl[PEER_ID]["role"] == "ROUTER")
