@@ -12,8 +12,8 @@ def node(i, hops, mqtt=False, env=None):
             "hopsAway": hops, "viaMqtt": mqtt, "lastHeard": now - 60, "environmentMetrics": env or {}}
 nodes = {1: node(1, 1), 2: node(2, 2), 3: node(3, 5), 4: node(4, 3), 5: node(5, 1), 6: node(6, 1, mqtt=True),
          7: node(7, 0, env={"temperature": 18.5, "relativeHumidity": 40})}
-m.iface = types.SimpleNamespace(nodesByNum=nodes, nodes={n["user"]["id"]: n for n in nodes.values()},
-                                getMyNodeInfo=lambda: {"user": {"id": "!00000007"}})
+m.use_iface(types.SimpleNamespace(nodesByNum=nodes, nodes={n["user"]["id"]: n for n in nodes.values()},
+                                  getMyNodeInfo=lambda: {"user": {"id": "!00000007"}}))
 
 def pkt(i, env=None, air=None, hops=None):
     d = {"portnum": "TELEMETRY_APP", "telemetry": {}}

@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import tempfile
+import threading
 import time
 import types
 
@@ -19,7 +20,8 @@ else:
 sys.path.insert(0, webui)
 import app as m  # noqa: E402
 from flask import jsonify  # noqa: E402
-from meshtastic.protobuf import config_pb2  # noqa: E402
+import admin  # noqa: E402
+from meshtastic.protobuf import admin_pb2, channel_pb2, localonly_pb2  # noqa: E402
 
 random.seed(11)
 m.init_db(m.DB_PATH)
@@ -61,14 +63,71 @@ NODES = [
     node(0x200E, "Сусід-клієнт", "SUSD", 1, 1.4, 4.9, "CLIENT", 6.5, heard=120),
 ]
 nodes = {n["num"]: n for n in NODES}
-lora = config_pb2.Config.LoRaConfig(region=config_pb2.Config.LoRaConfig.RegionCode.Value("EU_868"),
-                                    modem_preset=config_pb2.Config.LoRaConfig.ModemPreset.Value("LONG_FAST"),
-                                    use_preset=True, hop_limit=3)
 me = {"num": ME, "user": {"id": f"!{ME:08x}", "longName": "Демо-база", "shortName": "DEMO", "role": "CLIENT"},
       "deviceMetrics": {"batteryLevel": 87, "voltage": 4.05, "channelUtilization": 6.2, "airUtilTx": 1.1, "uptimeSeconds": 345600}}
-m.iface = types.SimpleNamespace(nodesByNum=nodes, nodes={n["user"]["id"]: n for n in NODES}, getMyNodeInfo=lambda: me,
-                                localNode=types.SimpleNamespace(localConfig=types.SimpleNamespace(lora=lora), channels=[]))
+nodes[ME] = {**nodes[ME], **me}
+
+
+class DemoIface:
+    """Підставний інтерфейс: «свій» вузол зі справжніми protobuf-налаштуваннями й віддалені, що відповідають на
+    адмін-запити із затримкою, як по радіо. Нічого не передається в ефір і не змінює реальних налаштувань."""
+
+    def __init__(self):
+        LC, MC = localonly_pb2.LocalConfig, localonly_pb2.LocalModuleConfig
+        self.nodesByNum, self.nodes = nodes, {n["user"]["id"]: n for n in NODES}
+        self.cfg, self.mod = LC(), MC()
+        self.cfg.lora.region, self.cfg.lora.modem_preset, self.cfg.lora.use_preset, self.cfg.lora.hop_limit = 2, 0, True, 3
+        self.cfg.device.role = 0
+        self.cfg.position.position_broadcast_secs = 900
+        self.mod.telemetry.device_update_interval = 1800
+        self.mod.mqtt.enabled = False
+        chans = []
+        for k in range(8):
+            ch = channel_pb2.Channel(index=k, role=1 if k == 0 else 0)
+            if k < 2:
+                ch.settings.name, ch.settings.psk = ("LongFast" if k == 0 else "Дача"), bytes([1 + k]) * 16
+            chans.append(ch)
+        self.remote = {"cfg": LC(), "mod": MC(), "chans": chans, "keys": {}}
+        self.remote["cfg"].lora.region, self.remote["cfg"].device.role = 2, 2
+        self.localNode = types.SimpleNamespace(nodeNum=ME, localConfig=self.cfg, moduleConfig=self.mod, channels=chans[:],
+                                               writeConfig=lambda s: None, writeChannel=lambda k: None,
+                                               setOwner=lambda a, b: None, setFixedPosition=lambda *a: None,
+                                               _getAdminChannelIndex=lambda: 0)
+        self._keys = {}
+
+    def getMyNodeInfo(self):
+        return me
+
+    def _getOrCreateByNum(self, num):
+        return self._keys.setdefault(num, {})
+
+    def sendData(self, p, num, portNum=None, wantAck=False, wantResponse=False, onResponse=None, onResponseAckPermitted=False,
+                 channelIndex=0, pkiEncrypted=False):
+        r, kind = admin_pb2.AdminMessage(), p.WhichOneof("payload_variant")
+        pk = {"decoded": {"portnum": "ROUTING_APP", "routing": {"errorReason": "NONE"}}}
+        if kind == "get_config_request":
+            name = admin_pb2.AdminMessage.ConfigType.Name(p.get_config_request).replace("_CONFIG", "").lower()
+            if name == "sessionkey":
+                self._keys.setdefault(num, {})["adminSessionPassKey"] = b"demo"
+            else:
+                getattr(r.get_config_response, name).CopyFrom(getattr(self.remote["cfg"], name))
+            pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        elif kind == "get_module_config_request":
+            name = {v: k for k, v in admin.MODULE_SECTIONS.items()}[admin_pb2.AdminMessage.ModuleConfigType.Name(p.get_module_config_request)]
+            getattr(r.get_module_config_response, name).CopyFrom(getattr(self.remote["mod"], name))
+            pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        elif kind == "get_channel_request":
+            r.get_channel_response.CopyFrom(self.remote["chans"][p.get_channel_request - 1])
+            pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        elif kind == "get_owner_request":
+            r.get_owner_response.long_name, r.get_owner_response.short_name = "Віддалений вузол", "RMT"
+            pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        if onResponse:
+            threading.Timer(1.2, onResponse, args=(pk,)).start()
+
+
 ID = lambda n: f"!{n:08x}"  # noqa: E731
+m.use_iface(DemoIface())
 
 # повідомлення
 msgs = [(-7200, 0x2001, "Пагорб-1 (роутер)", "^all", "Доброго ранку! Хто на зв'язку?"),
@@ -88,7 +147,7 @@ with m.db_lock, m.db:
     # графіки за добу
     for t in range(now - 86400, now, 300):
         x = (t - now) / 86400 * 2 * math.pi
-        m.db.execute("INSERT OR REPLACE INTO metric VALUES (?,?,?,?)",
+        m.db.execute("INSERT OR REPLACE INTO metric (t, chan, air, nodes) VALUES (?,?,?,?)",
                      (t, 5 + 3 * math.sin(x) + random.random(), 0.8 + 0.5 * math.sin(x + 1) + random.random() * 0.2,
                       13 + int(2 * math.sin(x * 3))))
     # довкілля
@@ -99,7 +158,7 @@ with m.db_lock, m.db:
                     x = (t - now) / 86400 * 2 * math.pi
                     base = n["environmentMetrics"].get({"temperature": "temperature", "humidity": "relativeHumidity", "pressure": "barometricPressure"}[k])
                     if base is not None:
-                        m.db.execute("INSERT INTO env VALUES (?,?,?,?,?)",
+                        m.db.execute("INSERT INTO env (t, node, hops, k, v) VALUES (?,?,?,?,?)",
                                      (t, n["user"]["id"], n["hopsAway"], k, base + {"temperature": 3, "humidity": 8, "pressure": 2}[k] * math.sin(x)))
 
 # зв'язки для карти

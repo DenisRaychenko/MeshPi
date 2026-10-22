@@ -7,7 +7,7 @@ HOST=${1:-chechen@10.10.92.30}
 cd "$(dirname "$0")"
 
 ssh "$HOST" "mkdir -p ~/meshpi/webui.new"
-scp -r webui/app.py webui/requirements.txt webui/constraints.txt webui/templates webui/static "$HOST:meshpi/webui.new/"
+scp -r webui/*.py webui/requirements.txt webui/constraints.txt webui/templates webui/static "$HOST:meshpi/webui.new/"
 scp Dockerfile docker-compose.yml backup.sh "$HOST:meshpi/"
 
 ssh "$HOST" 'bash -s' <<'REMOTE'

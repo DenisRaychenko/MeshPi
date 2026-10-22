@@ -322,3 +322,25 @@
   .envcard { border:1px solid var(--line); border-radius:12px; background:var(--sky-800); }
   .envcard .value { font-size:1.6rem; }
   .envcard .spark { width:100%; height:28px; margin:8px 0 4px; }
+
+  /* Керування вузлами */
+  .admingrid { display:grid; grid-template-columns: 230px minmax(0,1fr); gap:20px; align-items:start; }
+  #asecs .agroup { margin-bottom:14px; }
+  #asecs .agtitle { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-low); margin:0 0 6px 4px; }
+  #asecs button { display:block; width:100%; text-align:left; background:none; border:1px solid transparent; border-radius:8px;
+    color:var(--text-mid); padding:6px 10px; cursor:pointer; font:inherit; }
+  #asecs button:hover { color:var(--text-hi); border-color:var(--line); }
+  #asecs button.active { color:var(--text-hi); border-color:var(--signal); background:var(--btn-signal-hover-bg); }
+  #apane h3 { margin:0 8px 0 0; }
+  .afields { display:grid; gap:8px; margin-top:8px; }
+  .afield { display:grid; grid-template-columns: minmax(150px, 280px) minmax(0,1fr); gap:10px; align-items:center; }
+  .afield .aname { color:var(--text-mid); font-size:13px; }
+  .afield input[type=checkbox] { justify-self:start; width:18px; height:18px; }
+  .afs { border:1px solid var(--line); border-radius:8px; padding:8px 12px 12px; margin:6px 0; }
+  .afs legend { color:var(--text-mid); padding:0 6px; font-size:13px; }
+  .achans { display:grid; gap:12px; margin-top:10px; }
+  .achan { border:1px solid var(--line); border-radius:10px; padding:10px 14px 14px; margin-top:12px; display:grid; gap:8px; }
+  .achans .achan { margin-top:0; }
+  .achan h4 { margin:0 0 4px; }
+  #adminbox.busy { cursor:progress; }
+  @media (max-width: 760px) { .admingrid { grid-template-columns: 1fr; } .afield { grid-template-columns: 1fr; } }

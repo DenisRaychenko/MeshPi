@@ -4,7 +4,7 @@ WORKDIR /app
 COPY webui/requirements.txt webui/constraints.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
-COPY webui/app.py ./
+COPY webui/*.py ./
 COPY webui/templates ./templates
 COPY webui/static ./static
 

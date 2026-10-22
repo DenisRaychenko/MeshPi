@@ -21,7 +21,7 @@
 <header>
   <div class="brand"><div class="ring"><span class="ring-dot"></span></div>
     <div><h1>Meshpi</h1><p id="me">Meshtastic · Raspberry Pi</p></div></div>
-  <div class="row"><span id="pill" class="status-pill"><span class="dot"></span><span id="pilltxt">…</span></span>
+  <div class="row"><select id="nodesel" class="tg-input" title="Вибраний вузол: уся панель показує його" aria-label="Вузол"></select><span id="pill" class="status-pill"><span class="dot"></span><span id="pilltxt">…</span></span>
     <button type="button" id="theme" class="settings-link" title="Світла/темна тема">☾</button>
     <form method="post" action="/logout" style="margin:0"><button class="check-btn" title="Вийти з панелі">Вийти</button></form></div>
 </header>
@@ -30,6 +30,7 @@
   <button type="button" role="tab" data-tab="messages">Повідомлення</button>
   <button type="button" role="tab" data-tab="nodes">Вузли</button>
   <button type="button" role="tab" data-tab="mesh">Мережа</button>
+  <button type="button" role="tab" data-tab="admin">Керування</button>
   <button type="button" role="tab" data-tab="radio">Радіо</button>
   <button type="button" role="tab" data-tab="node">Вузол</button>
   <button type="button" role="tab" data-tab="system">Система</button>
@@ -152,6 +153,23 @@
     </table></div>
   </section>
   </div>
+  <div class="tabpane" data-tab="admin" role="tabpanel" hidden>
+<section class="panel" id="adminbox">
+    <h2>Керування вузлами</h2>
+    <div class="row" style="margin-bottom:8px">
+      <label>Вузол <select class="tg-input" id="atarget"></select></label>
+      <button type="button" id="areload" class="check-btn" title="Оновити список вузлів">⟳</button>
+      <span id="astat" class="hint"></span>
+    </div>
+    <p class="hint" style="margin:0 0 12px">Налаштування як у застосунку Meshtastic: пристрій, LoRa, позиція, живлення, мережа, екран, Bluetooth, модулі
+      й канали. Свій вузол читається миттєво. Віддалений вузол налаштовується по радіо через ваш вузол: кожен запит
+      це передача в ефір (десятки секунд), а на віддаленому ваш ключ має бути в security.admin_key. Операції йдуть по одній.</p>
+    <div class="admingrid">
+      <nav id="asecs" aria-label="Розділи налаштувань"></nav>
+      <div id="apane"></div>
+    </div>
+  </section>
+  </div>
   <div class="tabpane" data-tab="radio" role="tabpanel" hidden>
 <div id="pwr" class="grid"></div>
 <section class="panel">
@@ -268,6 +286,24 @@
   </section>
   </div>
   <div class="tabpane" data-tab="system" role="tabpanel" hidden>
+<section class="panel" id="connbox">
+    <h2>Вузли панелі</h2>
+    <p class="hint" style="margin:0 0 10px">Панель одночасно підключена до всіх вузлів зі списку й веде історію кожного окремо; перемикач у шапці
+      обирає, чий вузол показано. Адреса — TCP API meshtasticd (порт 4403) або проксі; віддалені вузли по радіо
+      налаштовуються у вкладці «Керування».</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Назва</th><th>Адреса</th><th>Стан</th><th></th></tr></thead>
+      <tbody id="connrows"></tbody>
+    </table></div>
+    <form id="connform" class="row" style="margin-top:12px">
+      <input class="tg-input" id="cname" placeholder="Назва (напр. «Дача»)" maxlength="40" required autocomplete="off">
+      <input class="tg-input" id="chost" placeholder="Адреса: 192.168.1.50" maxlength="253" required autocomplete="off">
+      <input class="tg-input" id="cport" type="number" min="1" max="65535" value="4403" style="width:90px" required>
+      <button class="check-btn" id="cgo">＋ Додати вузол</button>
+      <button type="button" class="reboot-btn" id="ccancel" hidden>Скасувати</button>
+    </form>
+    <p id="connmsg" class="hint" style="margin:8px 0 0"></p>
+  </section>
 <section class="panel">
     <h2>Журнал</h2>
     <div class="row"><select class="tg-input" id="unit"><option>meshtasticd</option><option>meshpi-proxy</option><option>meshpi-web</option></select><button type="button" id="rl" class="check-btn">↻ Оновити</button></div>
@@ -1020,5 +1056,7 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 })();</script>
 <script src="/static/env.js"></script>
 <script src="/static/mesh.js"></script>
+<script src="/static/conns.js"></script>
+<script src="/static/admin.js"></script>
 </body>
 </html>

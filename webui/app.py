@@ -20,7 +20,9 @@ from datetime import timedelta
 from urllib.parse import quote
 
 import secrets
-from flask import Flask, Response, jsonify, redirect, render_template, request, session
+
+import admin
+from flask import Flask, Response, has_request_context, jsonify, redirect, render_template, request, session
 from google.protobuf.message import DecodeError  # type: ignore[import-untyped]
 from meshtastic.protobuf import apponly_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2, telemetry_pb2
 from meshtastic.tcp_interface import TCPInterface
@@ -97,7 +99,30 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 log = logging.getLogger("meshpi")
-iface = None
+# ---- підключення до кількох вузлів ----
+# Панель тримає з'єднання з усіма вузлами зі списку (nodes.json) одночасно, тож історія кожного пишеться постійно;
+# у браузері показується вибраний (cookie-сесія). Кожен рядок в базі має власника — id підключення.
+NODES_FILE = os.environ.get("MESHPI_NODES_FILE", str(Path(DB_PATH).with_name("nodes.json")))
+CONN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
+
+
+class Conn:
+    """Одне підключення до вузла: адреса (TCP API meshtasticd чи проксі), інтерфейс бібліотеки й стан."""
+
+    def __init__(self, cid, name, host, port):
+        self.id, self.name, self.host, self.port = cid, name, host, int(port)
+        self.iface = None
+        self.error = None
+        self.dead = False  # підключення видалено — потік підключення завершується
+        self.admin_lock = threading.Lock()  # адмін-запити по радіо йдуть по одному (спільний стан підтверджень)
+
+    def public(self):
+        return {"id": self.id, "name": self.name, "host": self.host, "port": self.port,
+                "online": self.iface is not None, "error": self.error}
+
+
+conns: dict[str, Conn] = {}
+conns_lock = threading.Lock()
 rssi: dict[str, float] = {}  # останній RSSI за вузлом (є лише в пакетах, не в списку вузлів)
 db_lock = threading.Lock()
 scan: dict = {"state": "idle"}  # idle | running | restoring | done | stopped | error
@@ -116,47 +141,185 @@ def init_db(path):
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute("CREATE TABLE IF NOT EXISTS msg (id INTEGER PRIMARY KEY, t INT, sender TEXT, name TEXT,"
                " dest TEXT, ch INT, text TEXT, snr REAL, out INT)")
-    db.execute("CREATE TABLE IF NOT EXISTS metric (t INT PRIMARY KEY, chan REAL, air REAL, nodes INT)")
     db.execute("CREATE TABLE IF NOT EXISTS probe (node TEXT, kind TEXT, t REAL, res TEXT)")  # див. save_probe
     # показники довкілля від вузлів (телеметрія): одна точка на вузол і величину не частіше ENV_MIN_GAP
     db.execute("CREATE TABLE IF NOT EXISTS env (t INT, node TEXT, hops INT, k TEXT, v REAL)")
     db.execute("CREATE INDEX IF NOT EXISTS env_t ON env (t)")
-    # добовий архів зв'язків між вузлами (карта мережі): один рядок на добу й напрямок, лічильники пакетів
-    db.execute("CREATE TABLE IF NOT EXISTS link (day TEXT, src TEXT, dst TEXT, flow TEXT, kind TEXT, n INT,"
-               " snr_sum REAL, snr_n INT, t INT, PRIMARY KEY (day, src, dst, flow, kind))")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
     for c in ("pid INT", "reply INT", "emoji INT"):
         if c.split()[0] not in cols:  # база попередньої версії
             db.execute(f"ALTER TABLE msg ADD COLUMN {c}")
+    # власник рядка — id підключення (див. Conn); база до кількох вузлів вважається даними підключення «main»
+    for t in ("msg", "probe", "env"):
+        if "owner" not in {r[1] for r in db.execute(f"PRAGMA table_info({t})")}:
+            db.execute(f"ALTER TABLE {t} ADD COLUMN owner TEXT NOT NULL DEFAULT 'main'")
+    # метрики графіків і добовий архів зв'язків (карта мережі): власник входить у первинний ключ
+    for t, ddl, cols_old in (
+            ("metric", "CREATE TABLE metric (owner TEXT NOT NULL DEFAULT 'main', t INT, chan REAL, air REAL, nodes INT,"
+                       " PRIMARY KEY (owner, t))", "t, chan, air, nodes"),
+            ("link", "CREATE TABLE link (owner TEXT NOT NULL DEFAULT 'main', day TEXT, src TEXT, dst TEXT, flow TEXT,"
+                     " kind TEXT, n INT, snr_sum REAL, snr_n INT, t INT, PRIMARY KEY (owner, day, src, dst, flow, kind))",
+             "day, src, dst, flow, kind, n, snr_sum, snr_n, t")):
+        old = {r[1] for r in db.execute(f"PRAGMA table_info({t})")}
+        if not old:
+            db.execute(ddl)
+        elif "owner" not in old:  # перенесення таблиці попередньої версії: одна транзакція (DDL у SQLite транзакційний)
+            db.execute("BEGIN")
+            try:
+                db.execute(f"ALTER TABLE {t} RENAME TO {t}_old")
+                db.execute(ddl)
+                db.execute(f"INSERT INTO {t} (owner, {cols_old}) SELECT 'main', {cols_old} FROM {t}_old")
+                db.execute(f"DROP TABLE {t}_old")
+                db.commit()
+            except sqlite3.Error:
+                db.rollback()
+                raise
+    db.commit()  # зміни схеми й міграція мають дійти до файла, навіть якщо база одразу закриється (тести)
 
 
 MSG_COLS = "t, sender, name, dest, ch, text, snr, out, pid, reply, emoji"
 
 
-def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=0):
+def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=0, owner=None):
     """True — записано; False — повтор уже збереженого пакета або збій бази."""
+    owner = owner or cur_id()
     try:  # збій історії (повний диск, права) не має ламати радіо: повідомлення вже передане/прийняте
         with db_lock, db:
             # проксі після перепідключення повторює пропущені тексти — уже збережене не дублюємо
-            q = "SELECT 1 FROM msg WHERE pid = ? AND sender IS ?"
-            if pid and db.execute(q, (pid, sender)).fetchone():
+            q = "SELECT 1 FROM msg WHERE owner = ? AND pid = ? AND sender IS ?"
+            if pid and db.execute(q, (owner, pid, sender)).fetchone():
                 return False
-            db.execute(f"INSERT INTO msg ({MSG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                       (int(time.time()), sender, name, dest, ch, text, snr, out, pid, reply, emoji))
-            db.execute("DELETE FROM msg WHERE id <= (SELECT MAX(id) FROM msg) - ?", (KEEP,))
+            db.execute(f"INSERT INTO msg ({MSG_COLS}, owner) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (int(time.time()), sender, name, dest, ch, text, snr, out, pid, reply, emoji, owner))
+            db.execute("DELETE FROM msg WHERE owner = ? AND id <= (SELECT MAX(id) FROM msg WHERE owner = ?) - ?",
+                       (owner, owner, KEEP))
     except sqlite3.Error:
         log.exception("не вдалося записати повідомлення в історію")
         return False
     return True
 
 
-def recent(n=200):
+def recent(n=200, owner=None):
     with db_lock:
-        rows = db.execute(f"SELECT {MSG_COLS} FROM msg ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        rows = db.execute(f"SELECT {MSG_COLS} FROM msg WHERE owner = ? ORDER BY id DESC LIMIT ?",
+                          (owner or cur_id(), n)).fetchall()
     return [{"t": t, "from": s, "name": nm, "to": d, "ch": c, "text": x, "snr": snr, "out": bool(o),
              "pid": pid, "reply": rep, "emoji": bool(e)}
             for t, s, nm, d, c, x, snr, o, pid, rep, e in reversed(rows)]
+
+
+class OwnedTCP(TCPInterface):
+    """TCP-інтерфейс, що знає свого власника (id підключення) вже з першого пакета: його читач стартує в конструкторі."""
+
+    def __init__(self, owner, **kw):
+        self.meshpi_owner = owner
+        super().__init__(**kw)
+
+
+run_threads = False  # у тестах потоки підключення не стартують
+
+
+def drop_conn(c):
+    c.dead = True
+    i, c.iface = c.iface, None
+    if i is not None:
+        threading.Thread(target=lambda: _quiet(i.close), daemon=True).start()
+
+
+def conn_loop(c):
+    """Потік підключення: тримає з'єднання з одним вузлом, перепідключає кожні 5 с."""
+    down = False  # пишемо в журнал лише зміну стану, не кожні 5 с
+    while not c.dead:
+        if c.iface is None:
+            try:
+                i = OwnedTCP(c.id, hostname=c.host, portNumber=c.port)
+            except Exception as e:  # noqa: BLE001
+                c.error = str(e)[:200]
+                if not down:
+                    log.warning("вузол «%s» (%s:%s) недоступний: %s (повторюю кожні 5 с, без нових повідомлень)",
+                                c.name, c.host, c.port, e)
+                down = True
+            else:
+                if c.dead:
+                    _quiet(i.close)
+                else:
+                    c.iface, c.error, down = i, None, False
+                    log.info("підключено до «%s» %s:%s", c.name, c.host, c.port)
+        time.sleep(5)
+
+
+def load_conns():
+    """Привести реєстр підключень у відповідність до nodes.json; без файлу це одне підключення «main»
+    з MESH_HOST/MESH_PORT. Існуючі з тією ж адресою лишаються (з'єднання не рветься)."""
+    global conns
+    try:
+        items = json.loads(Path(NODES_FILE).read_text())
+        if not isinstance(items, list):
+            raise ValueError
+    except (OSError, ValueError):
+        items = [{"id": "main", "name": "Основний вузол", "host": MESH_HOST, "port": MESH_PORT}]
+    with conns_lock:
+        keep: dict[str, Conn] = {}
+        for it in items:
+            try:
+                cid, host, port = str(it["id"]), str(it["host"]).strip(), int(it["port"])
+                name = str(it.get("name") or cid)[:40]
+                if not CONN_ID_RE.match(cid) or cid in keep or not host or not 1 <= port <= 65535:
+                    continue
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            old = conns.get(cid)
+            if old and (old.host, old.port) == (host, port):
+                old.name = name
+                keep[cid] = old
+                continue
+            if old:
+                drop_conn(old)
+            keep[cid] = Conn(cid, name, host, port)
+            if run_threads:
+                threading.Thread(target=conn_loop, args=(keep[cid],), daemon=True).start()
+        if not keep:
+            keep["main"] = Conn("main", "Основний вузол", MESH_HOST, MESH_PORT)
+            if run_threads:
+                threading.Thread(target=conn_loop, args=(keep["main"],), daemon=True).start()
+        for cid, old in conns.items():
+            if cid not in keep:
+                drop_conn(old)
+        conns = keep
+
+
+def cur_id():
+    """Вибране в цій сесії підключення; поза запитом (фонові потоки, тести) — перше."""
+    cid = session.get("node") if has_request_context() else None
+    return cid if cid in conns else next(iter(conns))
+
+
+def cur():
+    return conns[cur_id()]
+
+
+def cur_iface():
+    return cur().iface
+
+
+def owner_of(interface):
+    return getattr(interface, "meshpi_owner", None) or next(iter(conns))
+
+
+iface = None  # лише для тестів: use_iface() кладе сюди підставний інтерфейс
+
+
+def use_iface(obj, cid=None):
+    """Підставити готовий інтерфейс (тести): стає з'єднанням підключення cid або першого."""
+    global iface
+    iface = obj
+    c = conns.get(cid) or next(iter(conns.values()))
+    c.iface = obj
+    try:
+        obj.meshpi_owner = c.id
+    except AttributeError:
+        pass
 
 
 def _eq(a, b):
@@ -301,12 +464,12 @@ def on_text(packet, interface):
     dec = packet["decoded"]
     new = add_msg(sender, name, dest_of(packet), packet.get("channel", 0), dec["text"],
                   packet.get("rxSnr"), int(mine), packet.get("id"), dec.get("replyId"),
-                  int(bool(dec.get("emoji"))))
+                  int(bool(dec.get("emoji"))), owner=owner_of(interface))
     if not mine and new and dec["text"].strip().casefold() in PING_WORDS:
         pong(packet, interface)
 
 
-pong_last: dict[str, float] = {}  # вузол -> час останньої відповіді
+pong_last: dict[tuple, float] = {}  # (підключення, вузол) -> час останньої відповіді
 
 
 def hops_word(n):
@@ -319,14 +482,14 @@ def hops_word(n):
 def pong(packet, i):
     """Автовідповідь на «ping»: «PONG» і кількість стрибків до відправника — туди ж, звідки прийшов
     (у канал або особисто), як відповідь на його повідомлення. Вмикається в «Налаштуваннях»."""
-    sender, now = sender_of(packet), time.time()
-    if not sender or not Path(PONGFILE).exists() or now - pong_last.get(sender, 0) < PONG_GAP:
+    sender, now, owner = sender_of(packet), time.time(), owner_of(i)
+    if not sender or not Path(PONGFILE).exists() or now - pong_last.get((owner, sender), 0) < PONG_GAP:
         return
     if now - (packet.get("rxTime") or now) > 300:  # давній (проксі повторив пропущене) — не відповідаємо
         return
     if len(pong_last) > 200:
         pong_last.clear()
-    pong_last[sender] = now
+    pong_last[(owner, sender)] = now
     # стрибки = hopStart − hopLimit; нульових полів бібліотека не пише; без hopStart (стара прошивка) — «?»
     hs = packet.get("hopStart")
     n = hs - (packet.get("hopLimit") or 0) if hs else None
@@ -337,7 +500,7 @@ def pong(packet, i):
     except Exception:  # noqa: BLE001 — збій відправки не має ламати прийом
         log.exception("не вдалося відповісти PONG")
         return
-    add_msg(None, "Ви", to, ch, text, None, 1, getattr(p, "id", None) or None, packet.get("id"))
+    add_msg(None, "Ви", to, ch, text, None, 1, getattr(p, "id", None) or None, packet.get("id"), owner=owner)
 
 
 # ---- довкілля: усереднення показників вузлів у межах кількох стрибків ----
@@ -366,8 +529,9 @@ ENV_DIGITS = {"temperature": 1, "humidity": 0, "pressure": 1, "iaq": 0, "gas": 1
               "pm25": 0, "co2": 0}
 
 
-def record_env(packet):
+def record_env(packet, owner=None):
     """Зберегти показники довкілля з пакета телеметрії (якщо це він і значення правдоподібні)."""
+    owner = owner or cur_id()
     if packet.get("viaMqtt"):
         return  # пакет прийшов через MQTT-міст, а не з радіоефіру
     dec = packet.get("decoded") or {}
@@ -391,10 +555,12 @@ def record_env(packet):
     try:
         with db_lock, db:
             for mid, v in vals:
-                last = db.execute("SELECT MAX(t) FROM env WHERE node = ? AND k = ?", (sender, mid)).fetchone()[0]
+                last = db.execute("SELECT MAX(t) FROM env WHERE owner = ? AND node = ? AND k = ?",
+                                  (owner, sender, mid)).fetchone()[0]
                 if last and now - last < ENV_MIN_GAP:
                     continue
-                db.execute("INSERT INTO env VALUES (?,?,?,?,?)", (now, sender, hops, mid, v))
+                db.execute("INSERT INTO env (t, node, hops, k, v, owner) VALUES (?,?,?,?,?,?)",
+                           (now, sender, hops, mid, v, owner))
             db.execute("DELETE FROM env WHERE t < ?", (now - ENV_KEEP,))
     except sqlite3.Error:
         log.exception("не вдалося записати показники довкілля")
@@ -404,7 +570,7 @@ def env_summary():
     """Середнє за вузлами в межах ENV_MAX_HOPS стрибків: беремо останній показник кожного вузла (не старший
     за ENV_WINDOW), усереднюємо між вузлами; для міні-графіка — те саме по півгодинних відрізках за добу."""
     now = int(time.time())
-    i = iface
+    i, owner = cur_iface(), cur_id()
     hops_now = {(n.get("user") or {}).get("id"): n.get("hopsAway") for n in all_nodes(i)}
     mqtt_ids = {(n.get("user") or {}).get("id") for n in all_nodes(i) if n.get("viaMqtt")}  # вузли лише через MQTT
 
@@ -415,10 +581,10 @@ def env_summary():
         return h if h is not None and h <= ENV_MAX_HOPS else None
 
     with db_lock:
-        recent = db.execute("SELECT node, k, v, t, hops FROM env WHERE t >= ? ORDER BY t",
-                            (now - ENV_WINDOW,)).fetchall()
-        day = db.execute("SELECT node, k, v, t, hops FROM env WHERE t >= ? ORDER BY t",
-                         (now - 86400,)).fetchall()
+        recent = db.execute("SELECT node, k, v, t, hops FROM env WHERE owner = ? AND t >= ? ORDER BY t",
+                            (owner, now - ENV_WINDOW)).fetchall()
+        day = db.execute("SELECT node, k, v, t, hops FROM env WHERE owner = ? AND t >= ? ORDER BY t",
+                         (owner, now - 86400)).fetchall()
     latest, sources = {}, {}
     for node, k, v, t, h in recent:
         latest[(node, k)] = (v, t, h)
@@ -468,7 +634,8 @@ def env_latest(nodes_list):
     now = int(time.time())
     out: dict[str, tuple[dict, int]] = {}
     with db_lock:
-        rows = db.execute("SELECT node, k, v, t FROM env WHERE t >= ? ORDER BY t", (now - 86400,)).fetchall()
+        rows = db.execute("SELECT node, k, v, t FROM env WHERE owner = ? AND t >= ? ORDER BY t",
+                          (cur_id(), now - 86400)).fetchall()
     for node, k, v, t in rows:
         vals, last = out.get(node, ({}, 0))
         vals[k] = round(v, ENV_DIGITS.get(k, 1))
@@ -498,7 +665,7 @@ def env_latest(nodes_list):
 # невідомі проміжні вузли (пунктир).
 LINK_KEEP = 60 * 86400   # с: скільки тримати добовий архів
 LINK_FLUSH = 30          # с: зв'язки збираються в пам'яті й пишуться в базу пачкою (менше записів на диск)
-link_buf: dict[tuple, list] = {}  # (день, src, dst, flow, kind) -> [пакетів, сума SNR, кількість SNR, час]
+link_buf: dict[tuple, list] = {}  # (підключення, день, src, dst, flow, kind) -> [пакетів, сума SNR, кількість SNR, час]
 link_lock = threading.Lock()
 link_flushed = 0.0
 ROUTER_ROLES = {"ROUTER", "ROUTER_CLIENT", "ROUTER_LATE", "REPEATER"}
@@ -512,12 +679,12 @@ def node_id(num):
     return f"!{num:08x}"
 
 
-def add_link(src, dst, flow, kind, snr=None, t=None):
+def add_link(src, dst, flow, kind, snr=None, t=None, owner=None):
     if not src or not dst or src == dst:
         return
     t = int(t or time.time())
     with link_lock:
-        e = link_buf.setdefault((day_of(t), src, dst, flow, kind), [0, 0.0, 0, t])
+        e = link_buf.setdefault((owner or cur_id(), day_of(t), src, dst, flow, kind), [0, 0.0, 0, t])
         e[0] += 1
         e[3] = t
         if isinstance(snr, (int, float)) and not isinstance(snr, bool) and math.isfinite(snr):
@@ -538,11 +705,12 @@ def flush_links(force=False):
         return
     try:
         with db_lock, db:
-            for (day, a, b, flow, kind), (n, ssum, scnt, t) in items:
-                db.execute("INSERT INTO link VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (day, src, dst, flow, kind)"
+            for (owner, day, a, b, flow, kind), (n, ssum, scnt, t) in items:
+                db.execute("INSERT INTO link (owner, day, src, dst, flow, kind, n, snr_sum, snr_n, t)"
+                           " VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (owner, day, src, dst, flow, kind)"
                            " DO UPDATE SET n = n + excluded.n, snr_sum = snr_sum + excluded.snr_sum,"
                            " snr_n = snr_n + excluded.snr_n, t = MAX(t, excluded.t)",
-                           (day, a, b, flow, kind, n, ssum, scnt, t))
+                           (owner, day, a, b, flow, kind, n, ssum, scnt, t))
             db.execute("DELETE FROM link WHERE t < ?", (int(now) - LINK_KEEP,))
     except sqlite3.Error:
         log.exception("не вдалося записати зв'язки між вузлами")
@@ -564,6 +732,11 @@ def record_link(packet, i):
     """Зв'язки з прийнятого з ефіру пакета (див. вище)."""
     if packet.get("viaMqtt") or i is None:
         return
+    owner = owner_of(i)
+
+    def put(src, dst, flow, kind, snr=None, t=None):
+        add_link(src, dst, flow, kind, snr, t, owner=owner)
+
     me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
     sender = sender_of(packet)
     if not me or not sender:
@@ -575,55 +748,56 @@ def record_link(packet, i):
         byte = packet.get("relayNode")
         relay = resolve_relay(i, byte, {me}) if isinstance(byte, int) else None
         if relay and used:
-            add_link(me, relay, "down", "direct" if used == 1 else "via", snr, t)
+            put(me, relay, "down", "direct" if used == 1 else "via", snr, t)
         return
     dec = packet.get("decoded") or {}
     if dec.get("portnum") == "NEIGHBORINFO_APP":  # вузол повідомляє, кого він сам чує
         info = dec.get("neighborinfo") or dec.get("neighborInfo") or {}
         for nb in info.get("neighbors") or []:
             if isinstance(nb.get("nodeId"), int):
-                add_link(node_id(nb["nodeId"]), sender, "up", "direct", nb.get("snr"), t)
+                put(node_id(nb["nodeId"]), sender, "up", "direct", nb.get("snr"), t)
     hs = packet.get("hopStart")
     used = hs - (packet.get("hopLimit") or 0) if hs else None
     byte = packet.get("relayNode")
     if used == 0:
-        add_link(sender, me, "up", "direct", snr, t)
+        put(sender, me, "up", "direct", snr, t)
         return
     if not isinstance(byte, int):
         return
     relay = resolve_relay(i, byte, {me, sender})
     if relay is None:
         return
-    add_link(relay, me, "up", "relay", snr, t)
+    put(relay, me, "up", "relay", snr, t)
     if used == 1:
-        add_link(sender, relay, "up", "direct", None, t)
+        put(sender, relay, "up", "direct", None, t)
     elif used and used > 1:
-        add_link(sender, relay, "up", "via", None, t)
+        put(sender, relay, "up", "via", None, t)
 
 
-def record_trace(data):
+def record_trace(data, owner=None):
     """Повний шлях з відповіді «Маршруту»: туди — «вниз», назад — «вгору»; кожен крок — пряме чуття."""
     for key, flow in (("towards", "down"), ("back", "up")):
         path = data.get(key) or []
         for a, b in zip(path, path[1:]):
             if a["id"] != "!ffffffff" and b["id"] != "!ffffffff":  # 0xffffffff — невідомий вузол на шляху
-                add_link(a["id"], b["id"], flow, "direct", b.get("snr"))
+                add_link(a["id"], b["id"], flow, "direct", b.get("snr"), owner=owner)
 
 
 def on_packet(packet, interface):
-    _quiet(lambda: record_env(packet))
+    owner = owner_of(interface)
+    _quiet(lambda: record_env(packet, owner))
     _quiet(lambda: record_link(packet, interface))
     _quiet(flush_links)
     if packet.get("rxRssi") is not None and sender_of(packet):
-        rssi[sender_of(packet)] = packet["rxRssi"]
-    if scan.get("listening"):
+        rssi[(owner, sender_of(packet))] = packet["rxRssi"]
+    if scan.get("listening") and scan.get("conn") == owner:
         scan_hear(packet, interface)
 
 
 def on_lost(interface):
-    global iface
-    if iface is interface:
-        iface = None
+    for c in list(conns.values()):
+        if c.iface is interface:
+            c.iface = None  # потік підключення за кілька секунд відновить з'єднання
     # закриваємо поза потоком читання інтерфейсу, щоб не блокувати його
     threading.Thread(target=lambda: _quiet(interface.close), daemon=True).start()
 
@@ -636,20 +810,21 @@ def _quiet(fn):
 
 
 def sample():
-    """Одна точка для графіків; тримаємо 7 діб."""
-    i = iface
-    if i is None:
-        return
-    m = (i.getMyNodeInfo() or {}).get("deviceMetrics", {})
-    now = int(time.time())
-    try:
-        with db_lock, db:
-            db.execute("INSERT OR REPLACE INTO metric VALUES (?,?,?,?)",
-                       (now, m.get("channelUtilization"), m.get("airUtilTx"),
-                        sum(1 for n in all_nodes(i) if not n.get("viaMqtt"))))
-            db.execute("DELETE FROM metric WHERE t < ?", (now - 7 * 86400,))
-    except sqlite3.Error:
-        log.exception("не вдалося записати метрики")
+    """Одна точка для графіків кожного підключеного вузла; тримаємо 7 діб."""
+    for c in list(conns.values()):
+        i = c.iface
+        if i is None:
+            continue
+        m = (i.getMyNodeInfo() or {}).get("deviceMetrics", {})
+        now = int(time.time())
+        try:
+            with db_lock, db:
+                db.execute("INSERT OR REPLACE INTO metric (owner, t, chan, air, nodes) VALUES (?,?,?,?,?)",
+                           (c.id, now, m.get("channelUtilization"), m.get("airUtilTx"),
+                            sum(1 for n in all_nodes(i) if not n.get("viaMqtt"))))
+                db.execute("DELETE FROM metric WHERE t < ?", (now - 7 * 86400,))
+        except sqlite3.Error:
+            log.exception("не вдалося записати метрики")
 
 
 def sampler():
@@ -657,22 +832,6 @@ def sampler():
         time.sleep(SAMPLE_EVERY)
         _quiet(sample)
         _quiet(flush_links)
-
-
-def connector():
-    global iface
-    down = False  # пишемо в журнал лише зміну стану, не кожні 5 с
-    while True:
-        if iface is None:
-            try:
-                iface = TCPInterface(hostname=MESH_HOST, portNumber=MESH_PORT)
-                log.info("підключено до %s:%s (проксі meshtasticd)", MESH_HOST, MESH_PORT)
-                down = False
-            except Exception as e:  # noqa: BLE001
-                if not down:
-                    log.warning("meshtasticd недоступний: %s (повторюю кожні 5 с, без нових повідомлень)", e)
-                down = True
-        time.sleep(5)
 
 
 def err(msg, code=400):
@@ -689,8 +848,8 @@ def _offline(_e):
 
 
 def need():
-    """Поточне з'єднання з meshtasticd або 503 для маршруту."""
-    i = iface
+    """З'єднання з вибраним вузлом або 503 для маршруту."""
+    i = cur_iface()
     if i is None:
         raise Offline
     return i
@@ -799,12 +958,13 @@ def mqtt_info(i):
 
 @app.get("/api/status")
 def status():
-    i = iface
+    i = cur_iface()
     if i is None:
-        return jsonify(connected=False, auth=auth_on())
+        return jsonify(connected=False, auth=auth_on(), conn=cur_id(), conns=[c.public() for c in conns.values()])
     me = i.getMyNodeInfo() or {}
     lora = i.localNode.localConfig.lora
     return jsonify(
+        conn=cur_id(), conns=[c.public() for c in conns.values()],
         mqtt=mqtt_info(i),
         connected=True, node=me.get("user", {}), metrics=me.get("deviceMetrics", {}),
         hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=sum(1 for n in all_nodes(i) if not n.get("viaMqtt")),
@@ -894,7 +1054,7 @@ def health():
             "spi": Path("/dev/spidev0.0").exists(),
             "service": sh("systemctl", "is-active", "meshtasticd").strip(),
             "errors": [x for x in lines if RADIO_ERR.search(x) and not HARMLESS.search(x)][-5:]})
-    return jsonify({**_health[1], "connected": iface is not None})
+    return jsonify({**_health[1], "connected": cur_iface() is not None})
 
 
 def chip_cap():
@@ -942,7 +1102,7 @@ def power():
     final = [int(x) for x in FINAL_RE.findall(text)]
     cap, radio = chip_cap()
     exe = shutil.which("meshtasticd")
-    i = iface
+    i = cur_iface()
     return jsonify(
         setting=i.localNode.localConfig.lora.tx_power if i else None,
         logged=logged[0] if logged else None, cap=cap, radio=radio,
@@ -1042,8 +1202,8 @@ def history():
     except ValueError:
         return err("hours: число")
     with db_lock:
-        rows = db.execute("SELECT t, chan, air, nodes FROM metric WHERE t >= ? ORDER BY t",
-                          (int(time.time()) - hours * 3600,)).fetchall()
+        rows = db.execute("SELECT t, chan, air, nodes FROM metric WHERE owner = ? AND t >= ? ORDER BY t",
+                          (cur_id(), int(time.time()) - hours * 3600)).fetchall()
     return unchanged_304(jsonify([{"t": t, "chan": c, "air": a, "nodes": n} for t, c, a, n in rows]))
 
 
@@ -1053,8 +1213,8 @@ def backup():
     i = need()
     user = (i.getMyNodeInfo() or {}).get("user", {})
     with db_lock:
-        msgs = db.execute(f"SELECT {MSG_COLS} FROM msg ORDER BY id").fetchall()
-        metrics = db.execute("SELECT t, chan, air, nodes FROM metric ORDER BY t").fetchall()
+        msgs = db.execute(f"SELECT {MSG_COLS} FROM msg WHERE owner = ? ORDER BY id", (cur_id(),)).fetchall()
+        metrics = db.execute("SELECT t, chan, air, nodes FROM metric WHERE owner = ? ORDER BY t", (cur_id(),)).fetchall()
     data = {"version": 1, "url": i.localNode.getURL(includeAll=True), "long": user.get("longName"),
             "short": user.get("shortName"), "msgs": msgs, "metrics": metrics}
     return Response(json.dumps(data), mimetype="application/json", headers={
@@ -1112,11 +1272,14 @@ def restore():
     if n:
         i.localNode.setOwner(*n)  # до setURL: після запису LoRa вузол перезапускається
     i.localNode.setURL("https://meshtastic.org/e/#" + b64)  # канали, ключі й налаштування LoRa
+    owner = cur_id()
     try:
         with db_lock, db:
-            db.execute("DELETE FROM msg")
-            db.executemany(f"INSERT INTO msg ({MSG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)", msg_rows[-KEEP:])
-            db.executemany("INSERT OR REPLACE INTO metric VALUES (?,?,?,?)", met_rows)
+            db.execute("DELETE FROM msg WHERE owner = ?", (owner,))
+            db.executemany(f"INSERT INTO msg ({MSG_COLS}, owner) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                           [(*r, owner) for r in msg_rows[-KEEP:]])
+            db.executemany("INSERT OR REPLACE INTO metric (t, chan, air, nodes, owner) VALUES (?,?,?,?,?)",
+                           [(*r, owner) for r in met_rows])
     except sqlite3.Error:
         log.exception("не вдалося відновити історію")
         return err("Канали відновлено, але історію записати не вдалося", 500)
@@ -1125,7 +1288,7 @@ def restore():
 
 @app.get("/api/nodes")
 def nodes():
-    i = iface
+    i, owner = cur_iface(), cur_id()
     out = []
     all_n = all_nodes(i)
     env = env_latest(all_n)
@@ -1137,7 +1300,7 @@ def nodes():
             "id": nid, "long": u.get("longName"), "short": u.get("shortName"),
             "hw": u.get("hwModel"), "snr": n.get("snr"), "heard": n.get("lastHeard"),
             "hops": n.get("hopsAway"), "lat": p.get("latitude"), "lon": p.get("longitude"),
-            "rssi": rssi.get(nid or ""),
+            "rssi": rssi.get((owner, nid or "")),
             "env": e[0] if e else None, "env_t": e[1] if e else None,
             "mqtt": bool(n.get("viaMqtt")),  # вузол відомий через MQTT-міст, а не з радіоефіру
         })
@@ -1153,10 +1316,12 @@ def api_mesh():
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         return err("day: РРРР-ММ-ДД")
     with_mqtt = request.args.get("mqtt") == "1"
-    i = iface
+    i, owner = cur_iface(), cur_id()
     with db_lock:
-        days = db.execute("SELECT day, SUM(n), COUNT(*) FROM link GROUP BY day ORDER BY day DESC").fetchall()
-        rows = db.execute("SELECT src, dst, flow, kind, n, snr_sum, snr_n, t FROM link WHERE day = ?", (day,)).fetchall()
+        days = db.execute("SELECT day, SUM(n), COUNT(*) FROM link WHERE owner = ? GROUP BY day ORDER BY day DESC",
+                          (owner,)).fetchall()
+        rows = db.execute("SELECT src, dst, flow, kind, n, snr_sum, snr_n, t FROM link WHERE owner = ? AND day = ?",
+                          (owner, day)).fetchall()
     known = {}
     for n in all_nodes(i):
         nid = (n.get("user") or {}).get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
@@ -1176,7 +1341,7 @@ def api_mesh():
         role = u.get("role") or "CLIENT"
         nodes.append({"id": nid, "name": u.get("longName") or nid, "short": u.get("shortName"), "role": role,
                       "repeater": role in ROUTER_ROLES or nid in repeaters, "me": nid == me,
-                      "hw": u.get("hwModel"), "snr": n.get("snr"), "rssi": rssi.get(nid),
+                      "hw": u.get("hwModel"), "snr": n.get("snr"), "rssi": rssi.get((owner, nid)),
                       "hops": n.get("hopsAway"), "mqtt": bool(n.get("viaMqtt")), "heard": n.get("lastHeard"),
                       "lat": p.get("latitude"), "lon": p.get("longitude")})
     mine = next((n for n in nodes if n["me"] and n["lat"] is not None and n["lon"] is not None), None)
@@ -1188,23 +1353,23 @@ def api_mesh():
 # ---- запити до іншого вузла (як «Подробиці» в застосунку) ----
 ASK = {"user", "trace", "signal", "device"}
 ASK_GAP = 30  # с між однаковими запитами до вузла: ефір спільний
-asked: dict[str, dict[str, dict]] = {}  # вузол -> вид -> {sent, done, ok, data, error}
+asked: dict[tuple, dict[str, dict]] = {}  # (підключення, вузол) -> вид -> {sent, done, ok, data, error}
 UNK_SNR = -128
 
 
-def _hop(num, snr=None):
+def _hop(num, snr=None, i=None):
     nid = f"!{num:08x}"
-    return {"id": nid, "name": node_name(iface, nid) if iface else nid,
+    return {"id": nid, "name": node_name(i, nid) if i else nid,
             "snr": None if snr is None or snr == UNK_SNR else snr / 4}
 
 
-def _route(start, mid, end, snrs):
+def _route(start, mid, end, snrs, i=None):
     """[старт, проміжні…, кінець]; SNR на кожному кроці (у пакеті — у чвертях дБ)."""
     snrs = list(snrs) if len(snrs) == len(mid) + 1 else [None] * (len(mid) + 1)
-    return [_hop(start)] + [_hop(n, s) for n, s in zip([*mid, end], snrs, strict=True)]
+    return [_hop(start, None, i)] + [_hop(n, s, i) for n, s in zip([*mid, end], snrs, strict=True)]
 
 
-def ask_result(kind, p):
+def ask_result(kind, p, i=None):
     """Відповідь вузла -> дані для сторінки; помилка маршрутизації (немає відповіді тощо) -> error."""
     d = p.get("decoded", {})
     if d.get("portnum") == "ROUTING_APP":
@@ -1219,8 +1384,8 @@ def ask_result(kind, p):
         out["data"] = d.get("telemetry", {}).get("deviceMetrics", {})
     elif kind == "trace":
         r = mesh_pb2.RouteDiscovery.FromString(d.get("payload", b""))
-        out["data"] = {"towards": _route(p["to"], r.route, p["from"], r.snr_towards),
-                       "back": _route(p["from"], r.route_back, p["to"], r.snr_back) if r.snr_back else None}
+        out["data"] = {"towards": _route(p["to"], r.route, p["from"], r.snr_towards, i),
+                       "back": _route(p["from"], r.route_back, p["to"], r.snr_back, i) if r.snr_back else None}
     return out
 
 
@@ -1231,7 +1396,7 @@ def ask():
     if not isinstance(to, str) or not re.fullmatch(r"![0-9a-f]{8}", to) or kind not in ASK:
         return err("to: !xxxxxxxx; kind: user | trace | signal | device")
     i = need()
-    prev = asked.get(to, {}).get(kind)
+    prev = asked.get((owner_of(i), to), {}).get(kind)
     if prev and time.time() - prev["sent"] < ASK_GAP:
         return err(f"Запит уже надіслано — повторити можна через {ASK_GAP} с", 429)
     start_ask(i, to, kind)
@@ -1240,17 +1405,18 @@ def ask():
 
 def start_ask(i, to, kind, done=None):
     """Надіслати запит вузлу; відповідь запишеться в `asked` (і в архів зв'язків). done (Event) — подати, коли вона прийде."""
-    if len(asked) >= 100 and to not in asked:  # пам'ять обмежена: забуваємо найстаріший вузол
+    owner = owner_of(i)
+    if len(asked) >= 100 and (owner, to) not in asked:  # пам'ять обмежена: забуваємо найстаріший вузол
         asked.pop(next(iter(asked)))
     entry = {"sent": time.time(), "done": None}
-    asked.setdefault(to, {})[kind] = entry
+    asked.setdefault((owner, to), {})[kind] = entry
 
     def on_response(p):
-        entry.update(ask_result(kind, p), done=time.time())
+        entry.update(ask_result(kind, p, i), done=time.time())
         if kind in PROBES:
-            save_probe(to, kind, entry)
+            save_probe(to, kind, entry, owner)
         if kind == "trace" and entry.get("ok"):
-            _quiet(lambda: record_trace(entry["data"]))
+            _quiet(lambda: record_trace(entry["data"], owner))
         if done:
             done.set()
 
@@ -1271,27 +1437,30 @@ def start_ask(i, to, kind, done=None):
 PROBES, PROBES_KEEP = ("trace", "signal"), 3  # які відповіді пам'ятати й скільки останніх на вузол
 
 
-def save_probe(node, kind, entry):
+def save_probe(node, kind, entry, owner=None):
     """Відповідь на «Маршрут»/«Сигнал» — в історію вузла (переживає перезапуск); лишаються 3 останні."""
+    owner = owner or cur_id()
     try:
         with db_lock, db:
-            db.execute("INSERT INTO probe VALUES (?,?,?,?)", (node, kind, entry["done"], json.dumps(entry)))
-            db.execute("DELETE FROM probe WHERE node = ? AND kind = ? AND rowid NOT IN (SELECT rowid"
-                       " FROM probe WHERE node = ? AND kind = ? ORDER BY t DESC LIMIT ?)",
-                       (node, kind, node, kind, PROBES_KEEP))
+            db.execute("INSERT INTO probe (node, kind, t, res, owner) VALUES (?,?,?,?,?)",
+                       (node, kind, entry["done"], json.dumps(entry), owner))
+            db.execute("DELETE FROM probe WHERE owner = ? AND node = ? AND kind = ? AND rowid NOT IN (SELECT rowid"
+                       " FROM probe WHERE owner = ? AND node = ? AND kind = ? ORDER BY t DESC LIMIT ?)",
+                       (owner, node, kind, owner, node, kind, PROBES_KEEP))
     except sqlite3.Error:
         log.exception("не вдалося зберегти результат перевірки")
 
 
 @app.get("/api/ask")
 def ask_results():
-    to = request.args.get("to", "")
+    to, owner = request.args.get("to", ""), cur_id()
     with db_lock:
-        rows = db.execute("SELECT kind, res FROM probe WHERE node = ? ORDER BY t DESC", (to,)).fetchall()
+        rows = db.execute("SELECT kind, res FROM probe WHERE owner = ? AND node = ? ORDER BY t DESC",
+                          (owner, to)).fetchall()
     history: dict[str, list] = {k: [] for k in PROBES}
     for k, res in rows:
         history[k].append(json.loads(res))
-    return jsonify({**asked.get(to, {}), "history": history})
+    return jsonify({**asked.get((owner, to), {}), "history": history})
 
 
 # ---- автоматичні маршрути: «Маршрут» по черзі до вузлів раз на 3 год і для щойно з'явилися ----
@@ -1303,8 +1472,12 @@ TRACE_WAIT = 150           # с чекати відповідь одного в�
 TRACE_PAUSE = 45           # с між запитами: ефір спільний
 TRACE_MAX_HOPS = int(os.environ.get("MESHPI_TRACE_HOPS", "5"))   # далі за стільки стрибків не питаємо
 TRACE_MAX_AGE = 86400      # с: питаємо лише вузли, чуті за останню добу
-trace_queue: collections.deque = collections.deque()
-trace_state: dict = {"current": None, "next_cycle": 0.0, "last": None, "seen": None}
+trace_ctx: dict[str, dict] = {}  # стан планувальника кожного підключення: черга, поточний, наступне коло…
+
+
+def tctx(owner):
+    return trace_ctx.setdefault(owner, {"queue": collections.deque(), "current": None, "next_cycle": 0.0,
+                                        "last": None, "seen": None})
 
 
 def trace_eligible(i):
@@ -1324,27 +1497,31 @@ def trace_eligible(i):
 def trace_tick(i):
     """Один крок планувальника: поповнити чергу (коло раз на TRACE_EVERY, нові вузли — першими)."""
     now = time.time()
+    ctx = tctx(owner_of(i))
+    queue = ctx["queue"]
     ids = trace_eligible(i)
     everyone = {nid for nid in ids}
-    seen = trace_state["seen"]
+    seen = ctx["seen"]
     if seen is None:  # перший запуск: вузли, що вже є, — не «нові»; перше коло через 2 хв
-        trace_state["seen"], trace_state["next_cycle"] = set(everyone), now + 120
+        ctx["seen"], ctx["next_cycle"] = set(everyone), now + 120
         return
     for nid in ids:
-        if nid not in seen and nid not in trace_queue:
-            trace_queue.appendleft(nid)  # новий вузол — без черги
+        if nid not in seen and nid not in queue:
+            queue.appendleft(nid)  # новий вузол — без черги
     seen |= everyone
-    if now >= trace_state["next_cycle"]:
-        trace_state["next_cycle"] = now + TRACE_EVERY
-        trace_queue.extend(nid for nid in ids if nid not in trace_queue)
+    if now >= ctx["next_cycle"]:
+        ctx["next_cycle"] = now + TRACE_EVERY
+        queue.extend(nid for nid in ids if nid not in queue)
 
 
 def trace_one(i, nid):
     done = threading.Event()
-    prev = asked.get(nid, {}).get("trace")
+    owner = owner_of(i)
+    ctx = tctx(owner)
+    prev = asked.get((owner, nid), {}).get("trace")
     if prev and time.time() - prev["sent"] < ASK_GAP:
         return  # щойно питали (наприклад, вручну)
-    trace_state["current"] = nid
+    ctx["current"] = nid
     try:
         start_ask(i, nid, "trace", done)
         ok = done.wait(TRACE_WAIT)
@@ -1352,32 +1529,38 @@ def trace_one(i, nid):
         log.exception("автомаршрут до %s не надіслано", nid)
         ok = False
     finally:
-        trace_state["current"] = None
-    entry = asked.get(nid, {}).get("trace") or {}
-    trace_state["last"] = {"id": nid, "ok": bool(ok and entry.get("ok")), "t": int(time.time())}
+        ctx["current"] = None
+    entry = asked.get((owner, nid), {}).get("trace") or {}
+    ctx["last"] = {"id": nid, "ok": bool(ok and entry.get("ok")), "t": int(time.time())}
 
 
 def autotrace():
+    """Планувальник усіх підключень по колу: один запит за раз на весь ефір панелі."""
     while True:
         time.sleep(15)
-        i = iface
-        if i is None or Path(NOTRACEFILE).exists() or scan["state"] in ("running", "restoring"):
+        if Path(NOTRACEFILE).exists() or scan["state"] in ("running", "restoring"):
             continue
-        try:
-            trace_tick(i)
-            if trace_queue:
-                trace_one(i, trace_queue.popleft())
-                time.sleep(TRACE_PAUSE)
-        except Exception:  # noqa: BLE001
-            log.exception("збій планувальника автомаршрутів")
+        for c in list(conns.values()):
+            i = c.iface
+            if i is None:
+                continue
+            try:
+                trace_tick(i)
+                queue = tctx(c.id)["queue"]
+                if queue:
+                    trace_one(i, queue.popleft())
+                    time.sleep(TRACE_PAUSE)
+            except Exception:  # noqa: BLE001
+                log.exception("збій планувальника автомаршрутів")
 
 
 @app.get("/api/autotrace")
 def get_autotrace():
-    last = trace_state["last"]
-    return jsonify(on=not Path(NOTRACEFILE).exists(), current=trace_state["current"], queued=len(trace_queue),
-                   next_cycle=int(trace_state["next_cycle"]) or None, every=TRACE_EVERY, max_hops=TRACE_MAX_HOPS,
-                   last=dict(last, name=node_name(iface, last["id"]) if iface else last["id"]) if last else None)
+    ctx, i = tctx(cur_id()), cur_iface()
+    last = ctx["last"]
+    return jsonify(on=not Path(NOTRACEFILE).exists(), current=ctx["current"], queued=len(ctx["queue"]),
+                   next_cycle=int(ctx["next_cycle"]) or None, every=TRACE_EVERY, max_hops=TRACE_MAX_HOPS,
+                   last=dict(last, name=node_name(i, last["id"]) if i else last["id"]) if last else None)
 
 
 @app.post("/api/autotrace")
@@ -1389,7 +1572,8 @@ def set_autotrace():
         Path(NOTRACEFILE).unlink(missing_ok=True)
     else:
         write_private(NOTRACEFILE, "")
-        trace_queue.clear()
+        for ctx in trace_ctx.values():
+            ctx["queue"].clear()
     return jsonify(on=on)
 
 
@@ -1401,8 +1585,8 @@ def forget():
         return err("peer: !xxxxxxxx")
     try:
         with db_lock, db:  # те саме правило, що dmPeer у logic.js
-            n = db.execute("DELETE FROM msg WHERE (out = 1 AND dest = ?) OR (out = 0 AND sender = ?"
-                           " AND dest IS NOT NULL AND dest != '^all')", (peer, peer)).rowcount
+            n = db.execute("DELETE FROM msg WHERE owner = ? AND ((out = 1 AND dest = ?) OR (out = 0 AND sender = ?"
+                           " AND dest IS NOT NULL AND dest != '^all'))", (cur_id(), peer, peer)).rowcount
     except sqlite3.Error:
         log.exception("не вдалося видалити розмову")
         return err("Не вдалося видалити історію", 500)
@@ -1543,9 +1727,11 @@ def scan_hear(packet, interface):
     n["direct"] = n["direct"] or bool(hs) and packet.get("hopLimit") == hs  # без hop-ів — почули напряму
 
 
-def set_preset(name):
-    """Міняє пресет і чекає, поки вузол перезапуститься, а з'єднання з ним повернеться."""
-    i = need()
+def set_preset(name, c):
+    """Міняє пресет вузла підключення c і чекає, поки він перезапуститься, а з'єднання з ним повернеться."""
+    i = c.iface
+    if i is None:
+        raise Offline
     lora = i.localNode.localConfig.lora
     value = LoRa.ModemPreset.Value(name)
     if lora.use_preset and lora.modem_preset == value:
@@ -1553,13 +1739,13 @@ def set_preset(name):
     lora.use_preset, lora.modem_preset = True, value
     i.localNode.writeConfig("lora")
     t = time.time()
-    while iface is i and time.time() - t < 30:  # спершу розрив старого з'єднання
+    while c.iface is i and time.time() - t < 30:  # спершу розрив старого з'єднання
         time.sleep(1)
-    if iface is i:  # не розірвалось — прошивка застосувала без перезапуску
+    if c.iface is i:  # не розірвалось — прошивка застосувала без перезапуску
         time.sleep(5)
         return
     while time.time() - t < SCAN_SETTLE:  # потім нове з'єднання
-        j = iface
+        j = c.iface
         if j is not None:
             if j.localNode.localConfig.lora.modem_preset != value:
                 raise RuntimeError(f"вузол не прийняв пресет {name}")
@@ -1569,15 +1755,17 @@ def set_preset(name):
     raise TimeoutError(f"вузол не повернувся після зміни пресета на {name}")
 
 
-def scan_run(presets, dwell):
-    """Потік сканування: по черзі слухає кожен пресет dwell секунд, наприкінці повертає початковий."""
+def scan_run(presets, dwell, c):
+    """Потік сканування вузла підключення c: по черзі слухає кожен пресет dwell секунд, наприкінці повертає початковий."""
     error = None
     try:
-        orig = _name(LoRa.ModemPreset, need().localNode.localConfig.lora.modem_preset)
-        write_private(SCANFILE, orig)
+        if c.iface is None:
+            raise Offline
+        orig = _name(LoRa.ModemPreset, c.iface.localNode.localConfig.lora.modem_preset)
+        write_private(SCANFILE, f"{c.id}\n{orig}")
         for k, name in enumerate(presets):
             scan.update(cur=k, listening=False)
-            set_preset(name)
+            set_preset(name, c)
             scan.update(ends=time.time() + dwell, listening=True)
             scan_stop.wait(dwell)
             scan["listening"] = False
@@ -1589,7 +1777,7 @@ def scan_run(presets, dwell):
     scan.update(listening=False, state="restoring")
     try:
         if Path(SCANFILE).exists():
-            set_preset(Path(SCANFILE).read_text().strip())
+            set_preset(orig, c)
             Path(SCANFILE).unlink(missing_ok=True)
     except Exception as e:  # noqa: BLE001
         error = (error + "; " if error else "") + f"не вдалося повернути пресет ({e}) — поверніть вручну"
@@ -1600,13 +1788,15 @@ def scan_run(presets, dwell):
 def scan_recover():
     """Після збою посеред сканування (перезапуск вебу) — повернути пресет із файлу."""
     try:
-        orig = Path(SCANFILE).read_text().strip()
+        text = Path(SCANFILE).read_text().strip()
     except OSError:
         return
-    while iface is None:
+    cid, _, orig = text.rpartition("\n")  # «підключення\nпресет»; старий формат — лише пресет вузла «main»
+    c = conns.get(cid or "main") or next(iter(conns.values()))
+    while c.iface is None and not c.dead:
         time.sleep(2)
     try:
-        set_preset(orig)
+        set_preset(orig, c)
         Path(SCANFILE).unlink(missing_ok=True)
         log.info("після перерваного сканування повернуто пресет %s", orig)
     except Exception:  # noqa: BLE001
@@ -1631,16 +1821,156 @@ def scan_start():
     if type(dwell) is not int or not 30 <= dwell <= 3600:
         return err("Час прослуховування має бути 30..3600 с")
     need()
+    c = cur()
     with scan_lock:
         if scan["state"] in ("running", "restoring"):
             return err("Сканування вже триває", 409)
         scan_stop.clear()
         scan.clear()
-        scan.update(state="running", presets=presets, dwell=dwell, cur=0, listening=False, ends=None,
+        scan.update(state="running", conn=c.id, presets=presets, dwell=dwell, cur=0, listening=False, ends=None,
                     error=None, results={p: {"packets": 0, "nodes": {}} for p in presets})
-    threading.Thread(target=scan_run, args=(presets, dwell), daemon=True).start()
+    threading.Thread(target=scan_run, args=(presets, dwell, c), daemon=True).start()
     return jsonify(ok=True)
 
+
+# ---- список підключених вузлів і перемикач ----
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+@app.get("/api/conns")
+def get_conns():
+    return jsonify(current=cur_id(), conns=[c.public() for c in conns.values()])
+
+
+@app.post("/api/conns")
+def edit_conns():
+    """action: add {name, host, port} | update {id, name, host, port} | remove {id} | select {id}."""
+    d = body()
+    action = d.get("action")
+    if action == "select":
+        cid = d.get("id")
+        if cid not in conns:
+            return err("Невідоме підключення", 404)
+        session["node"] = cid
+        return jsonify(current=cid)
+    if action not in ("add", "update", "remove"):
+        return err("action: add | update | remove | select")
+    items = {c.id: {"id": c.id, "name": c.name, "host": c.host, "port": c.port} for c in conns.values()}
+    if action == "remove":
+        cid = d.get("id")
+        if cid not in items:
+            return err("Невідоме підключення", 404)
+        if len(items) == 1:
+            return err("Не можна видалити останнє підключення")
+        del items[cid]
+    else:
+        name, host = d.get("name"), d.get("host")
+        port = d.get("port", 4403)
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 40:
+            return err("Назва: від 1 до 40 символів")
+        if not isinstance(host, str) or not HOST_RE.match(host.strip()):
+            return err("Адреса: ім'я хоста або IP (літери, цифри, крапка, дефіс)")
+        if type(port) is not int or not 1 <= port <= 65535:
+            return err("Порт: число 1..65535")
+        name, host = name.strip(), host.strip()
+        if action == "add":
+            base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20] or "node"
+            cid, n = base, 2
+            while cid in items:  # унікальний id: назва, назва-2, назва-3…
+                cid, n = f"{base}-{n}", n + 1
+            if len(items) >= 8:
+                return err("Не більше 8 вузлів")
+            items[cid] = {"id": cid, "name": name, "host": host, "port": port}
+        else:
+            cid = d.get("id")
+            if cid not in items:
+                return err("Невідоме підключення", 404)
+            items[cid].update(name=name, host=host, port=port)
+    try:
+        write_private(NODES_FILE, json.dumps(list(items.values()), ensure_ascii=False, indent=1))
+    except OSError:
+        log.exception("не вдалося записати %s", NODES_FILE)
+        return err("Не вдалося зберегти список вузлів", 500)
+    load_conns()
+    return jsonify(current=cur_id(), conns=[c.public() for c in conns.values()])
+
+
+# ---- адміністрування вузлів (свого й віддалених по радіо) ----
+# Віддалені операції тривають десятки секунд, тому вони виконуються в потоці-завданні: браузер запускає
+# його (/api/admin/job) і опитує стан. Одночасно на підключення — одне завдання (спільний ефір і стан підтверджень).
+jobs: dict[str, dict] = {}
+jobs_lock = threading.Lock()
+NODE_RE = re.compile(r"^(local|![0-9a-f]{8})$")
+JOB_OPS = {"read", "write", "channels", "write_channel", "owner", "set_owner", "metadata", "fixed_position", "action"}
+
+
+@app.get("/api/admin/schema")
+def admin_schema():
+    s = admin.sections()
+    return unchanged_304(jsonify(sections=s, schemas={n: admin.schema(n) for n in [*s["config"], *s["module"]]}))
+
+
+def _run_job(job, c, op, args):
+    try:
+        i = c.iface
+        if i is None:
+            raise admin.AdminError("Вузол панелі не на зв'язку")
+        job["result"] = admin.run(i, op, args, lambda t: job.update(progress=t))
+        job["state"] = "done"
+    except admin.AdminError as e:
+        job.update(state="error", error=str(e))
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — бібліотека викликає sys.exit у деяких збоях
+        log.exception("адмін-операція %s не вдалася", op)
+        job.update(state="error", error=f"Збій операції: {str(e)[:160] or type(e).__name__}")
+    finally:
+        job["finished"] = time.time()
+        c.admin_lock.release()
+
+
+@app.post("/api/admin/job")
+def admin_job():
+    d = body()
+    op, target = d.get("op"), d.get("target", "local")
+    if op not in JOB_OPS or not isinstance(target, str) or not NODE_RE.match(target):
+        return err("op: " + " | ".join(sorted(JOB_OPS)) + "; target: local або !xxxxxxxx")
+    if op in ("read", "write") and d.get("section") not in [*admin.CONFIG_SECTIONS, *admin.MODULE_SECTIONS]:
+        return err("Невідомий розділ")
+    if op == "write" and d.get("section") in admin.READONLY:
+        return err("Цей розділ лише для читання")
+    if op == "action":
+        name = d.get("name")
+        if name not in admin.ACTIONS:
+            return err("Невідома дія")
+        if name in admin.CONFIRM and d.get("confirm") is not True:
+            return err("Для цієї дії потрібне підтвердження (confirm: true)")
+    need()  # 503, якщо вузол панелі не на зв'язку
+    c = cur()
+    if not c.admin_lock.acquire(blocking=False):
+        return err("На цьому підключенні вже виконується інша адмін-операція — дочекайтеся її завершення", 409)
+    now = time.time()
+    job = {"id": secrets.token_hex(8), "op": op, "target": target, "conn": c.id, "state": "running", "progress": None,
+           "started": now, "finished": None, "result": None, "error": None}
+    with jobs_lock:
+        for k in [k for k, v in jobs.items() if v["finished"] and now - v["finished"] > 3600]:
+            del jobs[k]
+        while len(jobs) >= 50:
+            jobs.pop(next(iter(jobs)))
+        jobs[job["id"]] = job
+    args = {k: v for k, v in d.items() if k not in ("op",)}
+    args["target"] = target
+    threading.Thread(target=_run_job, args=(job, c, op, args), daemon=True).start()
+    return jsonify(job=job["id"])
+
+
+@app.get("/api/admin/job")
+def admin_job_status():
+    job = jobs.get(request.args.get("id", ""))
+    if job is None:
+        return err("Завдання не знайдено", 404)
+    return jsonify({k: job[k] for k in ("id", "op", "target", "conn", "state", "progress", "started", "finished", "result", "error")})
+
+
+load_conns()  # реєстр має бути непорожнім уже при імпорті (тести, обробники)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -1650,7 +1980,10 @@ if __name__ == "__main__":
     pub.subscribe(on_text, "meshtastic.receive.text")
     pub.subscribe(on_packet, "meshtastic.receive")
     pub.subscribe(on_lost, "meshtastic.connection.lost")
-    threading.Thread(target=connector, daemon=True).start()
+    run_threads = True
+    load_conns()  # старт потоків підключення для кожного вузла зі списку
+    for _c in list(conns.values()):
+        threading.Thread(target=conn_loop, args=(_c,), daemon=True).start()
     threading.Thread(target=sampler, daemon=True).start()
     threading.Thread(target=autotrace, daemon=True).start()
     threading.Thread(target=scan_recover, daemon=True).start()

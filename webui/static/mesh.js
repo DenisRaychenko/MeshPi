@@ -74,7 +74,7 @@
   // а без координат — стабільний за id.
   // Щоб значки не налазили: радіус кола росте з кількістю вузлів на ньому, сусіди на колі розсуваються за кутом,
   // а на щільному колі кожен другий зсунутий по радіусу (зигзаг).
-  const GAP = 46, RING_STEP = 90, TWO_PI = 2 * Math.PI;
+  const GAP = 46, RING_STEP = 80, RING_STEPS = {1: 190, 2: 160}, TWO_PI = 2 * Math.PI;
   function layout(nodes, origin, hops) {
     const groups = new Map(), pos = {};
     for (const n of nodes) {
@@ -85,8 +85,9 @@
       groups.get(key).push({n, th, brg: th, dist: known ? haversine(origin, n) : null, hops: h});
     }
     const need = key => { const m = (groups.get(key) || []).length; return m * GAP / TWO_PI / (m > 6 ? 1.6 : 1); };
-    const R = {0: Math.max(60, need(0))};
-    for (let h = 1; h <= RINGS; h++) R[h] = Math.max(R[h - 1] + RING_STEP, need(h));
+    // пропорції: ближні кола просторіші (там найбільше вузлів), далі крок менший
+    const R = {0: Math.max(95, need(0))};
+    for (let h = 1; h <= RINGS; h++) R[h] = Math.max(R[h - 1] + (RING_STEPS[h] || RING_STEP), need(h));
     R.x = Math.max(R[RINGS] + RING_STEP, need('x'));
     for (const [key, list] of groups) {
       const r = R[key], m = list.length, min = Math.min(GAP / r * (m > 6 ? 0.62 : 1), TWO_PI / m);  // мін. кут між сусідами

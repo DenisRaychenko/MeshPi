@@ -57,7 +57,7 @@ check("the cell value follows the node flag", "n.mqtt ? 'так' : 'ні'" in pa
 check("node details say where the node was heard", "n.mqtt ? 'через MQTT' : 'з радіоефіру'" in page)
 
 m.init_db(m.DB_PATH)
-m.iface = ns(**{**node(True).__dict__, "nodesByNum": {}, "nodes": {}}, getMyNodeInfo=lambda: {"user": {"id": "!1"}, "deviceMetrics": {}})
+m.use_iface(ns(**{**node(True).__dict__, "nodesByNum": {}, "nodes": {}}, getMyNodeInfo=lambda: {"user": {"id": "!1"}, "deviceMetrics": {}}))
 m.iface.localNode.localConfig = ns(lora=ns(hop_limit=5, channel_num=1, region=2, modem_preset=0, tx_power=10,
                                           override_frequency=0.0))
 j = m.app.test_client().get("/api/status").get_json()
