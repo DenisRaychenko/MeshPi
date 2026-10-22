@@ -1168,6 +1168,7 @@ def api_mesh():
         role = u.get("role") or "CLIENT"
         nodes.append({"id": nid, "name": u.get("longName") or nid, "short": u.get("shortName"), "role": role,
                       "repeater": role in ROUTER_ROLES or nid in repeaters, "me": nid == me,
+                      "hw": u.get("hwModel"), "snr": n.get("snr"), "rssi": rssi.get(nid),
                       "hops": n.get("hopsAway"), "mqtt": bool(n.get("viaMqtt")), "heard": n.get("lastHeard"),
                       "lat": p.get("latitude"), "lon": p.get("longitude")})
     mine = next((n for n in nodes if n["me"] and n["lat"] is not None and n["lon"] is not None), None)

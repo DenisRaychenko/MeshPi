@@ -76,7 +76,7 @@
       if (n.me) { pos[n.id] = {x: C, y: C, dist: 0, th: 0, r: 0}; continue; }
       if (origin && hasPos(n)) {
         const d = haversine(origin, n), th = bearing(origin, n), r = Math.max(radius(d), 0.3 * S);
-        pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: d, th, r};
+        pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: d, th, r, brg: th};  // brg — справжній азимут, th потім зсувається
       } else unknown.push(n);
     }
     unknown.sort((a, b) => (a.hops ?? 99) - (b.hops ?? 99) || (a.id < b.id ? -1 : 1));
@@ -103,6 +103,7 @@
   }
 
   function draw() {
+    hideTip();  // вузли перемальовуються — pointerleave для старих не прийде
     svg.replaceChildren();
     if (!data) return;
     const rings = ringsKm(), up = ui.swap.checked ? 'var(--signal)' : 'var(--crit)', down = ui.swap.checked ? 'var(--crit)' : 'var(--signal)';
@@ -164,8 +165,12 @@
       if (n.repeater && !n.me) g.append(el('rect', {x: p.x - 8, y: p.y - 8, width: 16, height: 16, transform: `rotate(45 ${p.x} ${p.y})`, fill}));
       else g.append(el('circle', {cx: p.x, cy: p.y, r: n.me ? 12 : 8, fill}));
       if (n.id === sel) g.append(el('circle', {cx: p.x, cy: p.y, r: 17, fill: 'none', stroke: 'var(--text-hi)', 'stroke-width': 2}));
-      g.append(el('text', {x: p.x, y: p.y + (n.me ? 25 : 21), 'text-anchor': 'middle', 'font-size': 11, fill: 'var(--text-hi)'}, nodeName(n)));
-      g.append(el('title', {}, `${n.name} ${n.id}${p.dist != null ? ' · ' + fmtKm(p.dist) : ''}`));
+      const full = n.name || n.short || n.id;
+      g.append(el('text', {x: p.x, y: p.y + (n.me ? 25 : 21), 'text-anchor': 'middle', 'font-size': 11, fill: 'var(--text-hi)'},
+        full.length > 26 ? full.slice(0, 25) + '…' : full));
+      g.addEventListener('pointerenter', ev => tip(n, p, ev));
+      g.addEventListener('pointermove', ev => placeTip(ev));
+      g.addEventListener('pointerleave', hideTip);
       g.onclick = ev => { ev.stopPropagation(); sel = sel === n.id ? null : n.id; draw(); info(); };
       gn.append(g);
     }
@@ -173,6 +178,52 @@
     setView();
     info.pos = pos;
   }
+
+  // спливаюче вікно з даними про вузол при наведенні
+  const tipBox = document.createElement('div');
+  tipBox.style.cssText = 'position:fixed;z-index:50;pointer-events:none;display:none;max-width:320px;padding:10px 12px;' +
+    'background:var(--sky-900);color:var(--text-hi);border:1px solid var(--signal);border-radius:8px;font-size:12px;' +
+    'line-height:1.5;box-shadow:0 6px 24px rgba(0,0,0,.45)';
+  document.body.append(tipBox);
+  const COMPASS = ['пн', 'пн-сх', 'сх', 'пд-сх', 'пд', 'пд-зх', 'зх', 'пн-зх'];
+  function tip(n, p, ev) {
+    const mine = data.links.filter(l => l.a === n.id || l.b === n.id);
+    const sum = f => mine.filter(f).reduce((s, l) => s + l.n, 0);
+    const deg = p.dist != null && !n.me ? ((p.brg * 180 / Math.PI) % 360 + 360) % 360 : null;
+    const rows = [
+      ['ID', n.id + (n.short ? ` · ${n.short}` : '')],
+      ['Роль', n.me ? 'цей вузол' : n.repeater ? 'ретранслятор' : n.role],
+      n.hw ? ['Плата', n.hw] : null,
+      n.hops != null ? ['Стрибків', n.hops] : null,
+      p.dist != null && !n.me ? ['Відстань', `${fmtKm(p.dist)}, ${Math.round(deg)}° ${COMPASS[Math.round(deg / 45) % 8]}`] : null,
+      hasPos(n) ? ['Координати', `${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}`] : ['Координати', 'невідомі'],
+      n.snr != null ? ['SNR', n.snr + ' дБ'] : null,
+      n.rssi != null ? ['RSSI', n.rssi + ' дБм'] : null,
+      n.heard ? ['Востаннє чутно', ago(n.heard) + ' тому'] : null,
+      ['Пакетів за добу', `▲ ${sum(l => l.flow === 'up')} · ▼ ${sum(l => l.flow === 'down')}`],
+      n.mqtt ? ['Джерело', 'через MQTT-міст'] : null,
+    ].filter(Boolean);
+    tipBox.replaceChildren();
+    const h = document.createElement('div');
+    h.style.cssText = 'font-weight:700;font-size:13px;margin-bottom:4px';
+    h.textContent = n.name || n.id;
+    tipBox.append(h);
+    for (const [k, v] of rows) {
+      const d = document.createElement('div'), a = document.createElement('span'), b = document.createElement('span');
+      a.style.color = 'var(--text-mid)'; a.textContent = k + ': '; b.textContent = v;
+      d.append(a, b); tipBox.append(d);
+    }
+    tipBox.style.display = 'block';
+    placeTip(ev);
+  }
+  function placeTip(ev) {
+    const w = tipBox.offsetWidth, h = tipBox.offsetHeight;
+    const x = ev.clientX + 16 + w > innerWidth ? ev.clientX - 16 - w : ev.clientX + 16;
+    const y = ev.clientY + 16 + h > innerHeight ? Math.max(4, innerHeight - h - 4) : ev.clientY + 16;
+    tipBox.style.left = Math.max(4, x) + 'px'; tipBox.style.top = y + 'px';
+  }
+  const hideTip = () => { tipBox.style.display = 'none'; };
+  svg.addEventListener('pointerleave', hideTip);
 
   const nameOf = id => { const n = data && data.nodes.find(x => x.id === id); return n ? nodeName(n) : id; };
   const linked = id => id === sel || data.links.some(l => (l.a === sel && l.b === id) || (l.b === sel && l.a === id));
@@ -201,7 +252,7 @@
       tr.insertCell().textContent = KIND[l.kind] || l.kind;
       tr.insertCell().textContent = l.n;
       tr.insertCell().textContent = l.snr != null ? l.snr : '—';
-      tr.insertCell().textContent = ago(Date.now() / 1000 - l.t);
+      tr.insertCell().textContent = ago(l.t) + ' тому';
     }
   }
 
