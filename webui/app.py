@@ -4,6 +4,7 @@ import binascii
 import collections
 import hashlib
 import hmac
+import io
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ from urllib.parse import quote
 import secrets
 
 import admin
+import segno
 from flask import Flask, Response, has_request_context, jsonify, redirect, render_template, request, session
 from google.protobuf.message import DecodeError  # type: ignore[import-untyped]
 from meshtastic.protobuf import apponly_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2, telemetry_pb2
@@ -147,7 +149,8 @@ def init_db(path):
     db.execute("CREATE INDEX IF NOT EXISTS env_t ON env (t)")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
-    for c in ("pid INT", "reply INT", "emoji INT"):
+    # ack: статус доставки приватного повідомлення — 0 надіслано, 1 хтось ретранслював, 2 дійшло до адресата, 3 помилка
+    for c in ("pid INT", "reply INT", "emoji INT", "ack INT"):
         if c.split()[0] not in cols:  # база попередньої версії
             db.execute(f"ALTER TABLE msg ADD COLUMN {c}")
     # власник рядка — id підключення (див. Conn); база до кількох вузлів вважається даними підключення «main»
@@ -181,7 +184,7 @@ def init_db(path):
 MSG_COLS = "t, sender, name, dest, ch, text, snr, out, pid, reply, emoji"
 
 
-def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=0, owner=None):
+def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=0, owner=None, ack=None):
     """True — записано; False — повтор уже збереженого пакета або збій бази."""
     owner = owner or cur_id()
     try:  # збій історії (повний диск, права) не має ламати радіо: повідомлення вже передане/прийняте
@@ -190,8 +193,8 @@ def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=
             q = "SELECT 1 FROM msg WHERE owner = ? AND pid = ? AND sender IS ?"
             if pid and db.execute(q, (owner, pid, sender)).fetchone():
                 return False
-            db.execute(f"INSERT INTO msg ({MSG_COLS}, owner) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (int(time.time()), sender, name, dest, ch, text, snr, out, pid, reply, emoji, owner))
+            db.execute(f"INSERT INTO msg ({MSG_COLS}, owner, ack) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (int(time.time()), sender, name, dest, ch, text, snr, out, pid, reply, emoji, owner, ack))
             db.execute("DELETE FROM msg WHERE owner = ? AND id <= (SELECT MAX(id) FROM msg WHERE owner = ?) - ?",
                        (owner, owner, KEEP))
     except sqlite3.Error:
@@ -202,11 +205,23 @@ def add_msg(sender, name, dest, ch, text, snr, out, pid=None, reply=None, emoji=
 
 def recent(n=200, owner=None):
     with db_lock:
-        rows = db.execute(f"SELECT {MSG_COLS} FROM msg WHERE owner = ? ORDER BY id DESC LIMIT ?",
+        rows = db.execute(f"SELECT {MSG_COLS}, ack FROM msg WHERE owner = ? ORDER BY id DESC LIMIT ?",
                           (owner or cur_id(), n)).fetchall()
     return [{"t": t, "from": s, "name": nm, "to": d, "ch": c, "text": x, "snr": snr, "out": bool(o),
-             "pid": pid, "reply": rep, "emoji": bool(e)}
-            for t, s, nm, d, c, x, snr, o, pid, rep, e in reversed(rows)]
+             "pid": pid, "reply": rep, "emoji": bool(e), "ack": ack}
+            for t, s, nm, d, c, x, snr, o, pid, rep, e, ack in reversed(rows)]
+
+
+def set_ack(owner, pid, status):
+    """Статус доставки нашого приватного повідомлення (див. ack у init_db): лише вгору, доставлене не скасовується помилкою."""
+    if not pid:
+        return
+    try:
+        with db_lock, db:
+            db.execute("UPDATE msg SET ack = ? WHERE owner = ? AND pid = ? AND out = 1 AND (ack IS NULL OR (ack < ? AND ack != 2))",
+                       (status, owner, pid, status))
+    except sqlite3.Error:
+        log.exception("не вдалося записати статус доставки")
 
 
 class OwnedTCP(TCPInterface):
@@ -783,8 +798,38 @@ def record_trace(data, owner=None):
                 add_link(a["id"], b["id"], flow, "direct", b.get("snr"), owner=owner)
 
 
+PKT_LOG = 300  # скільки останніх пакетів тримати в пам'яті для «Журналу пакетів» (на кожне підключення)
+pkt_log: dict[str, collections.deque] = {}
+
+
+def log_packet(packet, owner):
+    dec = packet.get("decoded")
+    hs = packet.get("hopStart")
+    relay = packet.get("relayNode")
+    pkt_log.setdefault(owner, collections.deque(maxlen=PKT_LOG)).append({
+        "t": int(packet.get("rxTime") or time.time()), "from": sender_of(packet), "to": dest_of(packet),
+        "port": (dec or {}).get("portnum") or "ЗАШИФРОВАНО", "snr": packet.get("rxSnr"), "rssi": packet.get("rxRssi"),
+        "hops": hs - (packet.get("hopLimit") or 0) if hs else None, "relay": f"{relay:02x}" if isinstance(relay, int) else None,
+        "mqtt": bool(packet.get("viaMqtt")), "ch": packet.get("channel"), "id": packet.get("id")})
+
+
+@app.get("/api/packets")
+def api_packets():
+    """Останні прийняті пакети вибраного вузла (найновіші першими) — як «Журнал пакетів» у застосунку."""
+    try:
+        n = min(max(int(request.args.get("limit", 100)), 1), PKT_LOG)
+    except ValueError:
+        return err("limit: число")
+    i = cur_iface()
+    rows = list(pkt_log.get(cur_id(), ()))[::-1][:n]
+    for r in rows:
+        r["from_name"] = node_name(i, r["from"]) if i and r["from"] else None
+    return jsonify(rows)
+
+
 def on_packet(packet, interface):
     owner = owner_of(interface)
+    _quiet(lambda: log_packet(packet, owner))
     _quiet(lambda: record_env(packet, owner))
     _quiet(lambda: record_link(packet, interface))
     _quiet(flush_links)
@@ -1303,6 +1348,8 @@ def nodes():
             "rssi": rssi.get((owner, nid or "")),
             "env": e[0] if e else None, "env_t": e[1] if e else None,
             "mqtt": bool(n.get("viaMqtt")),  # вузол відомий через MQTT-міст, а не з радіоефіру
+            "fav": bool(n.get("isFavorite")), "ignored": bool(n.get("isIgnored")), "muted": bool(n.get("isMuted")),
+            "role": u.get("role") or "CLIENT",
         })
     out.sort(key=lambda x: x["heard"] or 0, reverse=True)
     return unchanged_304(jsonify(out))
@@ -1624,14 +1671,30 @@ def send():
     except ValueError:
         return err("Реакція: reply — id повідомлення, emoji — true/false, текст — один емодзі")
     i = need()
-    p = send_text(i, text, to, ch, reply, emoji)
-    add_msg(None, "Ви", to, ch, text, None, 1, getattr(p, "id", None) or None, reply, int(emoji))
+    owner, track = owner_of(i), to != "^all" and not emoji  # доставку стежимо лише для особистих повідомлень
+
+    def on_ack(pk):
+        dec = pk.get("decoded", {})
+        if dec.get("routing", {}).get("errorReason", "NONE") != "NONE":
+            status = 3  # відмова: немає маршруту, вузол не підтвердив після повторів
+        else:  # підтвердження від адресата — доставлено; від нашого ж вузла — лише чутно ретрансляцію сусіда
+            frm = pk.get("fromId") or (node_id(pk["from"]) if isinstance(pk.get("from"), int) else None)
+            status = 2 if frm == to else 1
+        set_ack(owner, dec.get("requestId"), status)
+
+    p = send_text(i, text, to, ch, reply, emoji, on_ack if track else None)
+    add_msg(None, "Ви", to, ch, text, None, 1, getattr(p, "id", None) or None, reply, int(emoji), owner=owner,
+            ack=0 if track else None)
     return jsonify(ok=True)
 
 
-def send_text(i, text, to, ch, reply=None, emoji=False):
+def send_text(i, text, to, ch, reply=None, emoji=False, on_ack=None):
     """Текст або реакція-емодзі на повідомлення reply (як «вподобати» в застосунку). Повертає пакет з id.
-    У бібліотеки немає параметра emoji — пакет збирається тут, як у sendData (тест стежить за бібліотекою)."""
+    У бібліотеки немає параметра emoji — пакет збирається тут, як у sendData (тест стежить за бібліотекою).
+    on_ack — стежити за доставкою (потрібне підтвердження; sendText бібліотеки не віддає ACK обробнику)."""
+    if not emoji and on_ack:
+        return i.sendData(text.encode(), destinationId=to, portNum=portnums_pb2.PortNum.TEXT_MESSAGE_APP, wantAck=True,
+                          onResponse=on_ack, onResponseAckPermitted=True, channelIndex=ch, replyId=reply)
     if not emoji:
         return i.sendText(text, destinationId=to, channelIndex=ch, replyId=reply)
     p = mesh_pb2.MeshPacket(channel=ch)
@@ -1895,13 +1958,28 @@ def edit_conns():
     return jsonify(current=cur_id(), conns=[c.public() for c in conns.values()])
 
 
+@app.get("/api/channel-qr")
+def channel_qr():
+    """QR-код і текст посилання на канали вибраного вузла (як «Поділитися каналом» у застосунку).
+    Посилання містить ключі каналів: показуйте його лише тим, кому довіряєте."""
+    i = need()
+    try:
+        url = admin.share_url(i, request.args.get("all") != "0")["url"]
+    except admin.AdminError as e:
+        return err(str(e), 503)
+    buf = io.BytesIO()
+    segno.make(url, error="m").save(buf, kind="svg", scale=5, border=3, dark="#000000", light="#ffffff", xmldecl=False)
+    return jsonify(url=url, qr="data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode())
+
+
 # ---- адміністрування вузлів (свого й віддалених по радіо) ----
 # Віддалені операції тривають десятки секунд, тому вони виконуються в потоці-завданні: браузер запускає
 # його (/api/admin/job) і опитує стан. Одночасно на підключення — одне завдання (спільний ефір і стан підтверджень).
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
 NODE_RE = re.compile(r"^(local|![0-9a-f]{8})$")
-JOB_OPS = {"read", "write", "channels", "write_channel", "owner", "set_owner", "metadata", "fixed_position", "action"}
+JOB_OPS = {"read", "write", "channels", "write_channel", "owner", "set_owner", "metadata", "fixed_position", "action",
+           "request_position", "send_position", "canned", "set_canned", "share_url"}
 
 
 @app.get("/api/admin/schema")
@@ -1943,6 +2021,9 @@ def admin_job():
             return err("Невідома дія")
         if name in admin.CONFIRM and d.get("confirm") is not True:
             return err("Для цієї дії потрібне підтвердження (confirm: true)")
+    if op in ("request_position", "send_position") and not (d.get("node") == "^all" and op == "send_position"
+                                                           or isinstance(d.get("node"), str) and re.fullmatch(r"![0-9a-f]{8}", d["node"])):
+        return err("node: !xxxxxxxx" + (" або ^all" if op == "send_position" else ""))
     need()  # 503, якщо вузол панелі не на зв'язку
     c = cur()
     if not c.admin_lock.acquire(blocking=False):

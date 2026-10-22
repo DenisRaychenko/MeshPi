@@ -174,7 +174,7 @@ TLS (nginx, Caddy, Traefik) і додайте в `.env` рядок `MESHPI_COOKI
 | Змінна | Типово | Призначення |
 |---|---|---|
 | `MESHPI_USER`, `MESHPI_PASSWORD` | `admin` / з `.env` | вхід у панель |
-| `MESH_HOST`, `MESH_PORT` | `localhost` / `4404` | адреса й порт `meshtasticd` (або проксі) |
+| `MESH_HOST`, `MESH_PORT` | `localhost` / `4404` | адреса й порт першого вузла (`meshtasticd` чи проксі); додаткові вузли додаються в панелі: Система → «Вузли панелі» |
 | `MESHPI_ENV_HOPS` | `3` | не далі скількох стрибків усереднювати довкілля |
 | `MESHPI_TRACE_HOPS` | `5` | не далі скількох стрибків питати авто-маршрути |
 | `MESHPI_TRACE_EVERY` | `10800` | період кола авто-маршрутів, с |

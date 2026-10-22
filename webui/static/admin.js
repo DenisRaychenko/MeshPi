@@ -167,7 +167,22 @@
     const read = el('button', 'check-btn', '⟳ Прочитати канали'); read.type = 'button';
     head.append(title, read);
     const holder = el('div', 'achans');
-    pane.append(head, el('p', 'hint', 'Канал 0 — основний. PSK — ключ шифрування в base64 (16 або 32 байти; «нові ключі» створює випадковий). ' +
+    const share = el('div');  // QR і посилання на канали — лише для вузла, підключеного до панелі
+    if (!isRemote()) {
+      const qb = el('button', 'check-btn', '▦ QR і посилання'); qb.type = 'button';
+      const only = el('label'); const oc = el('input'); oc.type = 'checkbox'; only.append(oc, ' лише основний канал');
+      head.append(qb, only);
+      qb.onclick = () => guarded(async () => {
+        const r = await api('/api/channel-qr' + (oc.checked ? '?all=0' : ''));
+        const img = el('img'); img.src = r.qr; img.alt = 'QR-код каналів'; img.style.cssText = 'width:240px;height:240px;background:#fff;border-radius:8px;display:block;margin:8px 0';
+        const url = el('input', 'tg-input'); url.value = r.url; url.readOnly = true; url.style.width = '100%'; url.onfocus = () => url.select();
+        const cp = el('button', 'check-btn', 'Копіювати'); cp.type = 'button';
+        cp.onclick = () => navigator.clipboard.writeText(r.url).then(() => say('Посилання скопійовано.'), () => { url.select(); say('Виділено: натисніть Ctrl+C.'); });
+        const warn = el('p', 'hint', 'У посиланні й QR — ключі каналів і налаштування радіо. Показуйте їх лише тим, кому довіряєте.');
+        share.replaceChildren(img, url, cp, warn); say('QR сформовано.');
+      });
+    }
+    pane.append(head, share, el('p', 'hint', 'Канал 0 — основний. PSK — ключ шифрування в base64 (16 або 32 байти; «нові ключі» створює випадковий). ' +
       'Точність позиції — наскільки точно канал ділиться вашим розташуванням. Вимкнений канал (DISABLED) не використовується.'), holder);
     read.onclick = () => guarded(async () => {
       say('Читаю канали…');
@@ -238,6 +253,15 @@
       out.textContent = Object.entries(r.metadata).map(([k, v]) => `${k}: ${v}`).join('\n'); say('Прочитано.');
     });
     info.append(out);
+
+    const can = sec('Готові повідомлення (швидкий чат)');
+    const ta = row(can, 'Фрази через | (до 200 байт разом)', el('textarea', 'tg-input')); ta.rows = 3; ta.placeholder = 'Так|Ні|Іду до вас|Потрібна допомога';
+    can.append(el('p', 'hint', 'Працює, коли на вузлі ввімкнено модуль «Готові повідомлення» (розділ у «Модулях»). Фрази з\'являться кнопками під полем повідомлення.'));
+    btn(can, '⟳ Прочитати', async () => { say('Читаю…'); const r = await job({op: 'canned'}); ta.value = r.text || ''; say('Прочитано.'); });
+    btn(can, '✓ Записати', async () => {
+      say('Записую…'); await job({op: 'set_canned', text: ta.value}); say('Фрази записано.');
+      if (!isRemote() && window.reloadQuick) window.reloadQuick();
+    });
 
     const act = sec('Дії');
     const where = () => isRemote() ? 'ВІДДАЛЕНИЙ вузол ' + targetSel.selectedOptions[0].textContent : 'цей вузол';

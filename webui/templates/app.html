@@ -75,6 +75,7 @@
       <button class="check-btn">➤ Надіслати</button>
     </form>
     <div id="emopanel" class="emo-panel" hidden></div>
+    <div id="quick" class="row" hidden style="margin-top:8px"></div>
   </section>
   </div>
   <div class="tabpane" data-tab="nodes" role="tabpanel" hidden>
@@ -303,6 +304,21 @@
       <button type="button" class="reboot-btn" id="ccancel" hidden>Скасувати</button>
     </form>
     <p id="connmsg" class="hint" style="margin:8px 0 0"></p>
+  </section>
+<section class="panel">
+    <h2>Журнал пакетів</h2>
+    <p class="hint" style="margin:0 0 10px">Останні пакети, які прийняв вибраний вузол: від кого, кому, тип, SNR/RSSI, стрибки й байт ретранслятора
+      (останній байт id вузла, що передав пакет вам). Зашифровані пакети (чужі канали) без типу.</p>
+    <div class="row" style="margin-bottom:8px">
+      <select class="tg-input" id="pktlim"><option value="50">50</option><option value="100" selected>100</option><option value="300">300</option></select>
+      <button type="button" id="pktgo" class="check-btn">⟳ Оновити</button>
+      <label><input type="checkbox" id="pktauto"> оновлювати кожні 3 с</label>
+      <span id="pktnote" class="hint"></span>
+    </div>
+    <div class="table-wrap" style="max-height:420px;overflow:auto"><table>
+      <thead><tr><th>Час</th><th>Від</th><th>Кому</th><th>Тип</th><th>SNR</th><th>RSSI</th><th>Стрибки</th><th>Реле</th><th></th></tr></thead>
+      <tbody id="pktrows"></tbody>
+    </table></div>
   </section>
 <section class="panel">
     <h2>Журнал</h2>
@@ -670,6 +686,14 @@ function renderMessages() {
       a.href = /^www\./i.test(s) ? 'https://' + s : s; p.append(a);
     }
     reactionChips(p, m, rs);
+    if (m.out && m.ack != null) {  // статус доставки приватного повідомлення, як галочки в застосунку
+      const k = document.createElement('small');
+      k.textContent = ' ' + ['…', '✓', '✓✓', '✗'][m.ack];
+      k.title = ['надіслано, підтвердження ще немає', 'надіслано: сусід ретранслював, адресат ще не підтвердив',
+        'доставлено: адресат підтвердив', 'не доставлено: вузол не відповів після повторів'][m.ack];
+      k.style.color = m.ack === 3 ? 'var(--crit)' : m.ack === 2 ? 'var(--signal)' : '';
+      p.append(k);
+    }
     box.append(p);
   }
   if (stick) box.scrollTop = box.scrollHeight;
@@ -1058,5 +1082,8 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/mesh.js"></script>
 <script src="/static/conns.js"></script>
 <script src="/static/admin.js"></script>
+<script src="/static/nodeactions.js"></script>
+<script src="/static/packets.js"></script>
+<script src="/static/quick.js"></script>
 </body>
 </html>

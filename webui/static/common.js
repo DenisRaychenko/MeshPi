@@ -51,3 +51,17 @@ function chime() {
   const r = s && parseRtttl(s);
   playNotes(r ? r.notes : [{f: 880, ms: 150}]);
 }
+
+// Адмін-завдання (/api/admin/job): запустити й дочекатися результату; progress(завдання, мс) — для індикатора.
+async function runJob(body, progress) {
+  const {job: id} = await api('/api/admin/job', body);
+  const t0 = Date.now();
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1000));
+    const j = await api('/api/admin/job?id=' + id);
+    if (j.state === 'done') return j.result;
+    if (j.state === 'error') throw new Error(j.error);
+    if (progress) progress(j, Date.now() - t0);
+    if (Date.now() - t0 > 10 * 60 * 1000) throw new Error('Завдання виконується надто довго');
+  }
+}

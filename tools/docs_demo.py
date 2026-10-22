@@ -21,7 +21,7 @@ sys.path.insert(0, webui)
 import app as m  # noqa: E402
 from flask import jsonify  # noqa: E402
 import admin  # noqa: E402
-from meshtastic.protobuf import admin_pb2, channel_pb2, localonly_pb2  # noqa: E402
+from meshtastic.protobuf import admin_pb2, channel_pb2, localonly_pb2, mesh_pb2  # noqa: E402
 
 random.seed(11)
 m.init_db(m.DB_PATH)
@@ -92,6 +92,7 @@ class DemoIface:
         self.localNode = types.SimpleNamespace(nodeNum=ME, localConfig=self.cfg, moduleConfig=self.mod, channels=chans[:],
                                                writeConfig=lambda s: None, writeChannel=lambda k: None,
                                                setOwner=lambda a, b: None, setFixedPosition=lambda *a: None,
+                                               getURL=lambda includeAll=True: 'https://meshtastic.org/e/#CgcSAQE6AggBEg0IARAEOAFAA0gBUBo',
                                                _getAdminChannelIndex=lambda: 0)
         self._keys = {}
 
@@ -101,8 +102,23 @@ class DemoIface:
     def _getOrCreateByNum(self, num):
         return self._keys.setdefault(num, {})
 
-    def sendData(self, p, num, portNum=None, wantAck=False, wantResponse=False, onResponse=None, onResponseAckPermitted=False,
-                 channelIndex=0, pkiEncrypted=False):
+    def sendData(self, p, num=None, portNum=None, wantAck=False, wantResponse=False, onResponse=None, onResponseAckPermitted=False,
+                 channelIndex=0, pkiEncrypted=False, destinationId=None, replyId=None, hopLimit=None):
+        num = destinationId if num is None else num
+        if isinstance(p, bytes):  # текст: «доставлено» через 1,5 с, як підтвердження від адресата
+            self._pid = getattr(self, "_pid", 5000) + 1
+            if onResponse:
+                threading.Timer(1.5, onResponse, args=({"fromId": num, "decoded": {"portnum": "ROUTING_APP", "requestId": self._pid,
+                                                                                     "routing": {"errorReason": "NONE"}}},)).start()
+            return types.SimpleNamespace(id=self._pid)
+        if isinstance(p, mesh_pb2.Position):  # запит позиції вузла
+            if onResponse:
+                n = nodes.get(int(str(num).lstrip("!"), 16) if isinstance(num, str) else num, {})
+                pos = n.get("position") or {}
+                reply = {"decoded": {"portnum": "POSITION_APP", "position": {"latitudeI": int(pos.get("latitude", 0) * 1e7),
+                                                                          "longitudeI": int(pos.get("longitude", 0) * 1e7), "altitude": 180}}}
+                threading.Timer(1.2, onResponse, args=(reply,)).start()
+            return None
         r, kind = admin_pb2.AdminMessage(), p.WhichOneof("payload_variant")
         pk = {"decoded": {"portnum": "ROUTING_APP", "routing": {"errorReason": "NONE"}}}
         if kind == "get_config_request":
@@ -122,8 +138,18 @@ class DemoIface:
         elif kind == "get_owner_request":
             r.get_owner_response.long_name, r.get_owner_response.short_name = "Віддалений вузол", "RMT"
             pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        elif kind == "get_canned_message_module_messages_request":
+            r.get_canned_message_module_messages_response = self.canned
+            pk = {"decoded": {"portnum": "ADMIN_APP", "admin": {"raw": r}}}
+        elif kind == "set_canned_message_module_messages":
+            self.canned = p.set_canned_message_module_messages
         if onResponse:
             threading.Timer(1.2, onResponse, args=(pk,)).start()
+
+    canned = "Так|Ні|Іду до вас|Потрібна допомога"
+
+    def sendPosition(self, *a, **k):
+        pass
 
 
 ID = lambda n: f"!{n:08x}"  # noqa: E731

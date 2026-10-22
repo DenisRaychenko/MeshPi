@@ -365,17 +365,79 @@ def action(i, target, name, args, timeout=60):
             setattr(p, field, to_node_num(args["node"]))
         except (KeyError, ValueError, TypeError) as e:
             raise AdminError("node: !xxxxxxxx") from e
-    if not is_local(i, target):
-        ensure_session(i, target, timeout)
-    try:
-        call(i, target, p, timeout, ack_ok=True)
-    except AdminError:
-        if name in ("reboot", "shutdown", "factory_reset_config") and not is_local(i, target):
-            raise
-        if is_local(i, target) and name in ("reboot", "shutdown", "factory_reset_config"):
-            return {"applied": True, "note": "Команда надіслана; вузол вимикається чи перезапускається."}
-        raise
+    if is_local(i, target):  # свій вузол: як у бібліотеки — без очікування відповіді (він може одразу перезапуститися)
+        send_admin(i, _num(i, target), p, None)
+        return {"applied": True, "note": "Команду надіслано вузлу."}
+    ensure_session(i, target, timeout)
+    call(i, target, p, timeout, ack_ok=True)
     return {"applied": True}
+
+
+# ---- позиція, готові повідомлення, посилання на канали ----
+def request_position(i, node, timeout=60):
+    """Запит позиції в іншого вузла (як «Запросити позицію» в застосунку): вузол відповідає своєю останньою позицією."""
+    num = to_node_num(node)
+    ev, box = threading.Event(), {}
+
+    def cb(pk):
+        box["p"] = pk
+        ev.set()
+
+    i.sendData(mesh_pb2.Position(), num, portNum=portnums_pb2.PortNum.POSITION_APP, wantAck=True, wantResponse=True,
+               onResponse=cb)
+    if not ev.wait(timeout):
+        raise AdminError(f"Вузол не відповів за {timeout} с")
+    d = box["p"].get("decoded", {})
+    if d.get("portnum") == "ROUTING_APP":
+        raise AdminError(ERRORS.get(d.get("routing", {}).get("errorReason", ""), "вузол не відповів позицією"))
+    pos = d.get("position") or {}
+    lat, lon = pos.get("latitude"), pos.get("longitude")
+    if lat is None and pos.get("latitudeI") is not None:
+        lat, lon = pos["latitudeI"] / 1e7, pos.get("longitudeI", 0) / 1e7
+    if lat is None or lon is None:
+        raise AdminError("Вузол не має позиції або не ділиться нею")
+    return {"lat": lat, "lon": lon, "alt": pos.get("altitude"), "time": pos.get("time")}
+
+
+def send_position(i, node, lat, lon, alt):
+    """Надіслати свою позицію (вузлу чи всім): так вузли на карті бачать, де ви."""
+    try:
+        lat, lon, alt = float(lat), float(lon), int(alt or 0)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as e:
+        raise AdminError("Широта −90…90, довгота −180…180") from e
+    i.sendPosition(lat, lon, alt, destinationId=to_node_num(node) if node != "^all" else "^all")
+    return {"applied": True}
+
+
+def get_canned(i, target, timeout=60):
+    p = admin_pb2.AdminMessage()
+    p.get_canned_message_module_messages_request = True
+    raw = call(i, target, p, timeout).get("decoded", {}).get("admin", {}).get("raw")
+    if raw is None:
+        raise AdminError("Вузол відповів не списком готових повідомлень")
+    return {"text": raw.get_canned_message_module_messages_response}
+
+
+def set_canned(i, target, text, timeout=60):
+    if not isinstance(text, str) or len(text.encode()) > 200:
+        raise AdminError("Готові повідомлення: до 200 байт разом, розділювач — |")
+    p = admin_pb2.AdminMessage()
+    p.set_canned_message_module_messages = text
+    if is_local(i, target):
+        send_admin(i, _num(i, target), p, None)
+        return {"applied": True}
+    ensure_session(i, target, timeout)
+    call(i, target, p, timeout, ack_ok=True)
+    return {"applied": True}
+
+
+def share_url(i, include_all=True):
+    """Посилання на канали (як QR у застосунку) — лише для свого вузла: канали віддаленого треба спершу прочитати."""
+    if i.localNode.channels is None:
+        raise AdminError("Канали вузла ще не завантажені — спробуйте за хвилину")
+    return {"url": i.localNode.getURL(includeAll=include_all)}
 
 
 # ---- виконання з журналом прогресу ----
@@ -400,4 +462,16 @@ def run(i, op, a, progress=None):
         return set_fixed_position(i, target, a.get("lat"), a.get("lon"), a.get("alt", 0))
     if op == "action":
         return action(i, target, a.get("name"), a.get("args") or {})
+    if op == "request_position":
+        return request_position(i, a.get("node"))
+    if op == "send_position":
+        return send_position(i, a.get("node", "^all"), a.get("lat"), a.get("lon"), a.get("alt", 0))
+    if op == "canned":
+        return get_canned(i, target)
+    if op == "set_canned":
+        return set_canned(i, target, a.get("text"))
+    if op == "share_url":
+        if target != "local":
+            raise AdminError("Посилання на канали формується лише для вузла, підключеного до панелі")
+        return share_url(i, a.get("all", True) is not False)
     raise AdminError("Невідома операція")
