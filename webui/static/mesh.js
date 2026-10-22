@@ -74,7 +74,15 @@
   // а без координат — стабільний за id.
   // Щоб значки не налазили: радіус кола росте з кількістю вузлів на ньому, сусіди на колі розсуваються за кутом,
   // а на щільному колі кожен другий зсунутий по радіусу (зигзаг).
+  // Остаточно значки й підписи не накладаються: після розкладки по колах кожен вузол розглядається як прямокутник
+  // «значок + підпис» (підпис іде від центру назовні), а накладені прямокутники розсуваються — переважно вздовж
+  // кола, трохи й по радіусу. Якщо місця на колі не вистачає, воно розширюється й розкладка повторюється.
   const GAP = 46, RING_STEP = 80, RING_STEPS = {1: 190, 2: 160}, TWO_PI = 2 * Math.PI;
+  const LABEL_CH = 7, LABEL_MAX = 22;
+  const labelWidth = n => Math.min((n.name || n.short || n.id).length, LABEL_MAX) * LABEL_CH;
+  const ME_BOX = [C - 40, C - 16, C + 40, C + 42];  // центральний вузол із підписом під ним
+  const overlap = (a, b, mx, my) => [Math.min(a[2], b[2]) - Math.max(a[0], b[0]) + mx, Math.min(a[3], b[3]) - Math.max(a[1], b[1]) + my];
+
   function layout(nodes, origin, hops) {
     const groups = new Map(), pos = {};
     for (const n of nodes) {
@@ -82,31 +90,89 @@
       const h = hops[n.id], key = h == null ? 'x' : Math.min(h, RINGS), known = origin && hasPos(n);
       if (!groups.has(key)) groups.set(key, []);
       const th = known ? bearing(origin, n) : hashAngle(n.id);
-      groups.get(key).push({n, th, brg: th, dist: known ? haversine(origin, n) : null, hops: h});
+      groups.get(key).push({n, th, brg: th, dist: known ? haversine(origin, n) : null, hops: h, key, lw: labelWidth(n)});
     }
-    const need = key => { const m = (groups.get(key) || []).length; return m * GAP / TWO_PI / (m > 6 ? 1.6 : 1); };
-    // пропорції: ближні кола просторіші (там найбільше вузлів), далі крок менший
-    const R = {0: Math.max(95, need(0))};
-    for (let h = 1; h <= RINGS; h++) R[h] = Math.max(R[h - 1] + (RING_STEPS[h] || RING_STEP), need(h));
-    R.x = Math.max(R[RINGS] + RING_STEP, need('x'));
-    for (const [key, list] of groups) {
-      const r = R[key], m = list.length, min = Math.min(GAP / r * (m > 6 ? 0.62 : 1), TWO_PI / m);  // мін. кут між сусідами
-      for (let it = 0; it < 300 && m > 1; it++) {
-        for (const q of list) q.th = (q.th % TWO_PI + TWO_PI) % TWO_PI;
-        list.sort((a, b) => a.th - b.th);
-        let moved = false;
-        for (let i = 0; i < m; i++) {
-          const a = list[i], b = list[(i + 1) % m], d = b.th - a.th + (i === m - 1 ? TWO_PI : 0);
-          if (d < min - 1e-6) { const push = (min - d) / 2; a.th -= push; b.th += push; moved = true; }
+    const extra = {};  // скільки докинули до радіуса кола, коли на ньому не вистачило місця
+    let R = {}, items = [];
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const need = key => { const m = (groups.get(key) || []).length; return m * GAP / TWO_PI / (m > 6 ? 1.6 : 1); };
+      // пропорції: ближні кола просторіші (там найбільше вузлів), далі крок менший
+      R = {0: Math.max(95, need(0)) + (extra[0] || 0)};
+      for (let h = 1; h <= RINGS; h++) R[h] = Math.max(R[h - 1] + (RING_STEPS[h] || RING_STEP), need(h)) + (extra[h] || 0);
+      R.x = Math.max(R[RINGS] + RING_STEP, need('x')) + (extra.x || 0);
+      items = [];
+      for (const [key, list] of groups) {
+        const r = R[key], m = list.length, min = Math.min(GAP / r * (m > 6 ? 0.62 : 1), TWO_PI / m);  // мін. кут між сусідами
+        for (const q of list) q.th = q.brg;  // кожна спроба — від справжнього азимута
+        for (let it = 0; it < 300 && m > 1; it++) {
+          for (const q of list) q.th = (q.th % TWO_PI + TWO_PI) % TWO_PI;
+          list.sort((a, b) => a.th - b.th);
+          let moved = false;
+          for (let i = 0; i < m; i++) {
+            const a = list[i], b = list[(i + 1) % m], d = b.th - a.th + (i === m - 1 ? TWO_PI : 0);
+            if (d < min - 1e-6) { const push = (min - d) / 2; a.th -= push; b.th += push; moved = true; }
+          }
+          if (!moved) break;
         }
-        if (!moved) break;
+        list.sort((a, b) => a.th - b.th).forEach((q, i) => {
+          q.r0 = r; q.r = r + (m > 6 ? (i % 2 ? 9 : -9) : 0);
+          q.band = key === 0 ? 26 : 34;  // на скільки вузол може відійти від свого кола
+          items.push(q);
+        });
       }
-      list.sort((a, b) => a.th - b.th).forEach((q, i) => {
-        const rr = r + (m > 6 ? (i % 2 ? 9 : -9) : 0);
-        pos[q.n.id] = {x: C + rr * Math.sin(q.th), y: C - rr * Math.cos(q.th), dist: q.dist, th: q.th, r: rr, brg: q.brg, hops: q.hops};
-      });
+      const bad = relax(items);
+      if (!bad.size) break;
+      for (const key of bad) extra[key] = (extra[key] || 0) + 32;  // тісно: розширюємо ці кола й пробуємо знову
+    }
+    for (const q of items) {
+      pos[q.n.id] = {x: C + q.r * Math.sin(q.th), y: C - q.r * Math.cos(q.th), dist: q.dist, th: q.th, r: q.r, brg: q.brg, hops: q.hops};
     }
     return {pos, R, hasDirect: groups.has(0), hasUnknown: groups.has('x')};
+  }
+
+  // Розсуває накладені прямокутники; повертає ключі кіл, де накладання лишилися.
+  function relax(items) {
+    const put = q => { q.x = C + q.r * Math.sin(q.th); q.y = C - q.r * Math.cos(q.th); };
+    const boxOf = q => q.x >= C ? [q.x - 13, q.y - 12, q.x + 19 + q.lw, q.y + 12] : [q.x - 19 - q.lw, q.y - 12, q.x + 13, q.y + 12];
+    const MX = 4, MY = 3;
+    for (let it = 0; it < 250; it++) {
+      items.forEach(put);
+      const boxes = items.map(boxOf), dx = items.map(() => 0), dy = items.map(() => 0);
+      let any = false;
+      for (let a = 0; a < items.length; a++) {
+        const me = overlap(boxes[a], ME_BOX, MX, MY);  // від центрального вузла відштовхуємо лише цей
+        if (me[0] > 0 && me[1] > 0) { any = true; const ca = (boxes[a][0] + boxes[a][2]) / 2, cb = (boxes[a][1] + boxes[a][3]) / 2; if (me[0] < me[1]) dx[a] += (ca >= C ? 1 : -1) * (me[0] + 1); else dy[a] += (cb >= C ? 1 : -1) * (me[1] + 1); }
+        for (let b = a + 1; b < items.length; b++) {
+          const [ox, oy] = overlap(boxes[a], boxes[b], MX, MY);
+          if (ox <= 0 || oy <= 0) continue;
+          any = true;
+          if (ox < oy) {  // легше розвести по горизонталі
+            const s = ox / 2 + 0.5, sg = (boxes[b][0] + boxes[b][2]) >= (boxes[a][0] + boxes[a][2]) ? 1 : -1;
+            dx[a] -= sg * s; dx[b] += sg * s;
+          } else {
+            const s = oy / 2 + 0.5, sg = (boxes[b][1] + boxes[b][3]) >= (boxes[a][1] + boxes[a][3]) ? 1 : -1;
+            dy[a] -= sg * s; dy[b] += sg * s;
+          }
+        }
+      }
+      if (!any) return new Set();
+      items.forEach((q, i) => {  // назад у полярні координати: кут вільний, радіус — у межах смуги свого кола
+        const x = q.x + dx[i], y = q.y + dy[i];
+        q.th = Math.atan2(x - C, C - y);
+        q.r = Math.min(q.r0 + q.band, Math.max(q.r0 - q.band, 40, Math.hypot(x - C, y - C)));
+      });
+    }
+    items.forEach(put);  // що лишилося — кола, на яких і після розсування тісно
+    const boxes = items.map(boxOf), bad = new Set();
+    for (let a = 0; a < items.length; a++) {
+      const me = overlap(boxes[a], ME_BOX, MX, MY);
+      if (me[0] > 0 && me[1] > 0) bad.add(items[a].key);
+      for (let b = a + 1; b < items.length; b++) {
+        const [ox, oy] = overlap(boxes[a], boxes[b], 0, 0);
+        if (ox > 0 && oy > 0) { bad.add(items[a].key); bad.add(items[b].key); }
+      }
+    }
+    return bad;
   }
 
   // Ролі вузлів Meshtastic: підпис, колір і своя форма значка
