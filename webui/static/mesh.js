@@ -1,4 +1,4 @@
-// Карта мережі: кола відстані від цього вузла (типово 1, 3 і 5 км), вузли за справжнім азимутом і відстанню,
+// Карта мережі: кола стрибків (1…7) навколо цього вузла, вузли на колі за своїми стрибками й справжнім азимутом,
 // стрілки зв'язків: «вгору» (до нас) — червоні, «вниз» (від нас) — зелені. Дані — з /api/mesh, архів по днях.
 // Значення з мережі вставляємо лише через textContent.
 (function () {
@@ -16,7 +16,7 @@
     set(k, v) { try { localStorage.setItem('mesh_' + k, v); } catch (e) { /* без сховища — ок */ } },
   };
   const C = 450, MAXR = 420, HOME = {x: 0, y: 0, w: 900};
-  const ui = {day: $('#mday'), prev: $('#mprev'), next: $('#mnext'), rings: $('#mrings'), via: $('#mvia'),
+  const ui = {day: $('#mday'), prev: $('#mprev'), next: $('#mnext'), via: $('#mvia'),
               mqtt: $('#mmqtt'), swap: $('#mswap'), reset: $('#mreset'), zin: $('#mzin'), zout: $('#mzout'), note: $('#mnote'), info: $('#minfo'),
               body: $('#mlinks'), legend: $('#mlegend')};
   let data = null, sel = null, view = {...HOME};
@@ -38,13 +38,10 @@
     setView();
   }
 
-  ui.rings.value = store.get('rings', '1,3,5');
   for (const k of ['via', 'mqtt', 'swap']) ui[k].checked = store.get(k, k === 'via' ? '1' : '0') === '1';
 
-  const ringsKm = () => {
-    const r = [...new Set(ui.rings.value.split(/[\s,;]+/).map(Number).filter(v => v > 0 && isFinite(v)))].sort((a, b) => a - b);
-    return (r.length ? r : [1, 3, 5]).slice(0, 6);
-  };
+  const RINGS = 7;  // 1…7 хопів: стільки найбільше дозволяє Meshtastic
+  const hopWord = n => n === 1 ? 'хоп' : n < 5 ? 'хопи' : 'хопів';
   const rad = d => d * Math.PI / 180;
   function haversine(a, b) {  // км
     const dLat = rad(b.lat - a.lat), dLon = rad(b.lon - a.lon);
@@ -60,30 +57,31 @@
   const fmtKm = d => d < 1 ? Math.round(d * 1000) + ' м' : d.toFixed(d < 10 ? 1 : 0) + ' км';
   const nodeName = n => n.short || n.name || n.id;
 
-  // Видимий радіус: кожен проміжок між кільцями займає однакову ширину (перше коло — 1 км, друге — 3 км…).
-  function layout(nodes, origin, rings) {
-    const k = rings.length, S = MAXR / (k + 1.9), pos = {};
-    const radius = d => {
-      let prev = 0;
-      for (let i = 0; i < k; i++) {
-        if (d <= rings[i]) return i * S + (d - prev) / (rings[i] - prev) * S;
-        prev = rings[i];
-      }
-      return k * S + Math.min(1, Math.log(d / rings[k - 1]) / Math.log(4)) * 0.9 * S;  // далі за останнє коло — стиснуто
-    };
-    const unknown = [];
+  // Стрибки вузла: з вузла (hopsAway), інакше з графа зв'язків — найкоротший шлях від нас мінус пряме чуття.
+  function hopsMap(nodes, links, me) {
+    const adj = {};
+    for (const l of links) { (adj[l.a] = adj[l.a] || []).push(l.b); (adj[l.b] = adj[l.b] || []).push(l.a); }
+    const dist = {[me]: 0}, queue = [me];
+    for (let i = 0; i < queue.length; i++) for (const x of adj[queue[i]] || []) if (!(x in dist)) { dist[x] = dist[queue[i]] + 1; queue.push(x); }
+    const out = {};
+    for (const n of nodes) out[n.id] = n.hops ?? (n.id in dist ? Math.max(0, dist[n.id] - 1) : null);
+    return out;
+  }
+  const hashAngle = id => { let h = 0; for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return h % 3600 / 3600 * 2 * Math.PI; };
+
+  // Кола — стрибки: 1…7 (hopsAway), прямі сусіди (0) — всередині першого кола. Кут — справжній азимут,
+  // а без координат — стабільний за id.
+  function layout(nodes, origin, hops) {
+    const S = MAXR / (RINGS + 1.4), pos = {};
+    let unknown = false;
     for (const n of nodes) {
-      if (n.me) { pos[n.id] = {x: C, y: C, dist: 0, th: 0, r: 0}; continue; }
-      if (origin && hasPos(n)) {
-        const d = haversine(origin, n), th = bearing(origin, n), r = Math.max(radius(d), 0.3 * S);
-        pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: d, th, r, brg: th};  // brg — справжній азимут, th потім зсувається
-      } else unknown.push(n);
+      if (n.me) { pos[n.id] = {x: C, y: C, dist: 0, th: 0, r: 0, brg: 0}; continue; }
+      const h = hops[n.id], known = origin && hasPos(n);
+      const r = h == null ? (RINGS + 0.9) * S : h === 0 ? 0.55 * S : Math.min(h, RINGS) * S;
+      if (h == null) unknown = true;
+      const th = known ? bearing(origin, n) : hashAngle(n.id);
+      pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: known ? haversine(origin, n) : null, th, r, brg: th, hasBrg: !!known, hops: h};
     }
-    unknown.sort((a, b) => (a.hops ?? 99) - (b.hops ?? 99) || (a.id < b.id ? -1 : 1));
-    unknown.forEach((n, i) => {
-      const th = (i + 0.5) / unknown.length * 2 * Math.PI, r = (k + 1.5) * S;
-      pos[n.id] = {x: C + r * Math.sin(th), y: C - r * Math.cos(th), dist: null, th, r};
-    });
     // розсуваємо накладені вузли вздовж кола (відстань від центру при цьому не міняється)
     const list = Object.values(pos).filter(p => p.r > 0);
     if (list.length < 300) {
@@ -99,16 +97,16 @@
         if (!moved) break;
       }
     }
-    return {pos, S, k, hasUnknown: unknown.length > 0};
+    return {pos, S, hasUnknown: unknown};
   }
 
   function draw() {
     hideTip();  // вузли перемальовуються — pointerleave для старих не прийде
     svg.replaceChildren();
     if (!data) return;
-    const rings = ringsKm(), up = ui.swap.checked ? 'var(--signal)' : 'var(--crit)', down = ui.swap.checked ? 'var(--crit)' : 'var(--signal)';
+    const up = ui.swap.checked ? 'var(--signal)' : 'var(--crit)', down = ui.swap.checked ? 'var(--crit)' : 'var(--signal)';
     const showVia = ui.via.checked;
-    const L = layout(data.nodes, data.origin, rings), pos = L.pos;
+    const L = layout(data.nodes, data.origin, hopsMap(data.nodes, data.links, data.me)), pos = L.pos;
     const defs = el('defs');
     for (const [id, col] of [['arUp', up], ['arDown', down]]) {
       const m = el('marker', {id, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 9, markerHeight: 9, markerUnits: 'userSpaceOnUse', orient: 'auto'});
@@ -117,17 +115,15 @@
     }
     svg.append(defs);
 
-    // кола відстані
+    // кола стрибків
     const g0 = el('g'); svg.append(g0);
-    rings.forEach((km, i) => {
-      g0.append(el('circle', {cx: C, cy: C, r: (i + 1) * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1}));
-      g0.append(el('text', {x: C + 4, y: C - (i + 1) * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, km + ' км'));
-    });
-    g0.append(el('circle', {cx: C, cy: C, r: (L.k + 0.95) * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-dasharray': '2 6'}));
-    g0.append(el('text', {x: C + 4, y: C - (L.k + 0.95) * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, '> ' + rings[L.k - 1] + ' км'));
+    for (let i = 1; i <= RINGS; i++) {
+      g0.append(el('circle', {cx: C, cy: C, r: i * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-width': 1}));
+      g0.append(el('text', {x: C + 4, y: C - i * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, `${i} ${hopWord(i)}`));
+    }
     if (L.hasUnknown) {
-      g0.append(el('circle', {cx: C, cy: C, r: (L.k + 1.5) * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-dasharray': '1 5'}));
-      g0.append(el('text', {x: C + 4, y: C - (L.k + 1.5) * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, 'без координат'));
+      g0.append(el('circle', {cx: C, cy: C, r: (RINGS + 0.9) * L.S, fill: 'none', stroke: 'var(--line)', 'stroke-dasharray': '1 5'}));
+      g0.append(el('text', {x: C + 4, y: C - (RINGS + 0.9) * L.S - 3, fill: 'var(--text-low)', 'font-size': 11}, 'стрибки невідомі'));
     }
 
     // зв'язки: об'єднуємо різні види одного напрямку; пунктир — лише коли шлях іде через невідомі вузли
@@ -194,7 +190,7 @@
       ['ID', n.id + (n.short ? ` · ${n.short}` : '')],
       ['Роль', n.me ? 'цей вузол' : n.repeater ? 'ретранслятор' : n.role],
       n.hw ? ['Плата', n.hw] : null,
-      n.hops != null ? ['Стрибків', n.hops] : null,
+      p.hops != null ? ['Стрибків', p.hops + (n.hops == null ? ' (за зв\'язками)' : '')] : null,
       p.dist != null && !n.me ? ['Відстань', `${fmtKm(p.dist)}, ${Math.round(deg)}° ${COMPASS[Math.round(deg / 45) % 8]}`] : null,
       hasPos(n) ? ['Координати', `${n.lat.toFixed(5)}, ${n.lon.toFixed(5)}`] : ['Координати', 'невідомі'],
       n.snr != null ? ['SNR', n.snr + ' дБ'] : null,
@@ -312,14 +308,13 @@
   ui.day.onchange = load;
   ui.prev.onclick = () => { ui.day.selectedIndex += 1; load(); };
   ui.next.onclick = () => { ui.day.selectedIndex -= 1; load(); };
-  ui.rings.onchange = () => { store.set('rings', ui.rings.value); draw(); };
   ui.via.onchange = ui.swap.onchange = () => { store.set('via', ui.via.checked ? '1' : '0'); store.set('swap', ui.swap.checked ? '1' : '0'); legend(); draw(); table(); };
   ui.mqtt.onchange = () => { store.set('mqtt', ui.mqtt.checked ? '1' : '0'); load(); };
 
   function legend() {
     const up = ui.swap.checked ? 'var(--signal)' : 'var(--crit)', down = ui.swap.checked ? 'var(--crit)' : 'var(--signal)';
     ui.legend.replaceChildren();
-    for (const [col, txt] of [[up, '▲ вгору — до нас: що вузли передають нам'], [down, '▼ вниз — від нас: наші передачі, шлях «туди» з «Маршруту»']]) {
+    for (const [col, txt] of [[up, '▲ вгору — до нас: що вузли передають нам'], [down, '▼ вниз — від нас: наші пакети, які сусіди ретранслювали, і «Маршрут»']]) {
       const s = document.createElement('span'); s.textContent = txt; s.style.color = col; ui.legend.append(s);
     }
     const t = document.createElement('span'); t.className = 'hint';

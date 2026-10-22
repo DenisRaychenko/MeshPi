@@ -52,7 +52,8 @@ m.record_link(pkt(0x6E6, relay=0xE6, hop_start=3, hop_limit=3, snr=7.0), m.iface
 m.record_link(pkt(0x2B2, relay=0xA1, hop_start=3, hop_limit=2), m.iface)               # 1 hop: 2B2 -> 1A1 -> me
 m.record_link(pkt(0x3C3, relay=0xA1, hop_start=3, hop_limit=1), m.iface)               # 2 hops: unknown middle
 m.record_link(pkt(0x2B2, relay=0xA1, hop_start=3, hop_limit=2, viaMqtt=True), m.iface) # MQTT copy: ignored
-m.record_link(pkt(ME, relay=0xA1, hop_start=3, hop_limit=2), m.iface)                  # our own packet echoed back
+m.record_link(pkt(ME, relay=0xA1, hop_start=3, hop_limit=2), m.iface)                  # our own packet echoed back: "down" link
+m.record_link(pkt(ME, hop_start=3, hop_limit=3), m.iface)                              # our own packet, no relay: nothing
 m.record_link(pkt(0x3C3, relay=0x99, hop_start=3, hop_limit=2), m.iface)               # relay byte matches nobody
 m.record_link(pkt(0x2B2, hop_start=3, hop_limit=2), m.iface)                           # no relay byte: nothing to draw
 L = links()
@@ -61,7 +62,9 @@ check("direct sender -> me, two packets, mean SNR kept",
 check("relay -> me recorded", L.get((ID(0x1A1), ID(ME), "up", "relay"), (0,))[0] == 2)
 check("1 hop: sender -> relay is a direct link", L.get((ID(0x2B2), ID(0x1A1), "up", "direct"), (0,))[0] == 1)
 check("2 hops: sender -> relay is 'via' (unknown middle)", L.get((ID(0x3C3), ID(0x1A1), "up", "via"), (0,))[0] == 1)
-check("MQTT copy, own echo, unknown relay and no relay byte add nothing", len(L) == 4, str(sorted(L)))
+check("own packet echoed by a neighbour = 'down' link me -> relay",
+      L.get((ID(ME), ID(0x1A1), "down", "direct"), (0,))[0] == 1)
+check("MQTT copy, unknown relay and no relay byte add nothing", len(L) == 5, str(sorted(L)))
 
 # relay byte 0xA1 matches 1A1 (0 hops) and 5A1 (3 hops): the nearer one wins; two equally near -> ambiguous
 check("nearest candidate wins", m.resolve_relay(m.iface, 0xA1, set()) == ID(0x1A1))
@@ -74,7 +77,8 @@ check("MQTT-only node is never a relay", m.resolve_relay(m.iface, 0xD4, set()) i
 hop = lambda n, s=None: {"id": ID(n), "name": "x", "snr": s}
 m.record_trace({"towards": [hop(ME), hop(0x1A1, 6.0), hop(0x2B2, 3.0)], "back": [hop(0x2B2), hop(0xFFFFFFFF), hop(ME)]})
 L = links()
-check("trace towards -> 'down' links with SNR", L.get((ID(ME), ID(0x1A1), "down", "direct")) == (1, 6.0, 1)
+check("trace towards -> 'down' links with SNR (adds to the echo seen earlier: 5.0 + 6.0)",
+      L.get((ID(ME), ID(0x1A1), "down", "direct")) == (2, 11.0, 2)
       and L.get((ID(0x1A1), ID(0x2B2), "down", "direct"))[0] == 1)
 check("unknown hop in trace is skipped", not any("ffffffff" in a or "ffffffff" in b for a, b, _, _ in L))
 

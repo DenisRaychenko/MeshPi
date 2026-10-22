@@ -566,9 +566,17 @@ def record_link(packet, i):
         return
     me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
     sender = sender_of(packet)
-    if not me or not sender or sender == me:
+    if not me or not sender:
         return
     t, snr = packet.get("rxTime") or time.time(), packet.get("rxSnr")
+    if sender == me:  # наш пакет, який сусід ретранслював і ми почули: так видно шлях «вниз» без «Маршруту»
+        hs = packet.get("hopStart")
+        used = hs - (packet.get("hopLimit") or 0) if hs else None
+        byte = packet.get("relayNode")
+        relay = resolve_relay(i, byte, {me}) if isinstance(byte, int) else None
+        if relay and used:
+            add_link(me, relay, "down", "direct" if used == 1 else "via", snr, t)
+        return
     dec = packet.get("decoded") or {}
     if dec.get("portnum") == "NEIGHBORINFO_APP":  # вузол повідомляє, кого він сам чує
         info = dec.get("neighborinfo") or dec.get("neighborInfo") or {}
