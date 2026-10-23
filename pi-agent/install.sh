@@ -12,8 +12,18 @@ command -v journalctl >/dev/null || { echo "Потрібен systemd (journalctl
 ENVF=/etc/mesh-radio-agent/env
 LIB=/usr/local/lib/mesh-radio-agent
 
-read -rp "Порт агента [8097]: " PORT; PORT=${PORT:-8097}
-read -rp "IP сервера панелі, якому дозволено питати (Enter: будь-який із токеном): " ALLOW
+# введене перевіряємо: стороння літера чи зіпсований байт (розкладка клавіатури!) у файлі середовища зупиняє службу
+while :; do
+  read -rp "Порт агента [8097]: " PORT; PORT=$(printf '%s' "${PORT:-8097}" | tr -d '[:space:]')
+  if printf '%s' "$PORT" | LC_ALL=C grep -qE '^[0-9]{2,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then break; fi
+  echo "Порт має бути числом 1..65535 (цифри латиницею). Спробуйте ще раз."
+done
+while :; do
+  read -rp "IP сервера панелі, якому дозволено питати (Enter: будь-який із токеном): " ALLOW
+  ALLOW=$(printf '%s' "$ALLOW" | tr -d '[:space:]')
+  if [ -z "$ALLOW" ] || printf '%s\n' "$ALLOW" | LC_ALL=C grep -qE '^[0-9a-fA-F:.]+(,[0-9a-fA-F:.]+)*$'; then break; fi
+  echo "Некоректний IP: лише цифри, крапки та коми (перевірте розкладку клавіатури: латиниця). Спробуйте ще раз."
+done
 
 # окремий користувач без оболонки; читає журнал через групу systemd-journal
 id meshagent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin meshagent
@@ -62,7 +72,6 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
-MemoryMax=48M
 
 [Install]
 WantedBy=multi-user.target
