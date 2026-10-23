@@ -2282,6 +2282,70 @@ def nodes():
     return unchanged_304(jsonify(out))
 
 
+# ---- карта «очима вузла»: центр карти мережі — інший вузол (наприклад, роутер, доступний лише по радіо) ----
+NETVIEW_FILE = os.environ.get("MESHPI_NETVIEW_FILE", str(Path(DB_PATH).with_name("netview.json")))
+
+
+def netview_all():
+    try:
+        d = json.loads(Path(NETVIEW_FILE).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def netview_of(owner):
+    v = netview_all().get(owner) or {}
+    node = v.get("node") if isinstance(v.get("node"), str) and re.fullmatch(r"![0-9a-f]{8}", v.get("node", "")) else None
+    return {"on": bool(v.get("on")) and node is not None, "node": node}
+
+
+@app.get("/api/netview")
+def api_netview_get():
+    """Чий погляд на мережу показує вкладка «Мережа» і кого можна вибрати (вузли, відомі панелі)."""
+    i, owner = cur_iface(), cur_id()
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    cand = []
+    for n in all_nodes(i):
+        u = n.get("user") or {}
+        nid = u.get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        if nid and nid != me and not n.get("viaMqtt"):
+            cand.append({"id": nid, "name": u.get("longName") or nid, "short": u.get("shortName"), "role": u.get("role") or "CLIENT",
+                         "fav": bool(n.get("isFavorite"))})
+    cand.sort(key=lambda c: (not c["fav"], c["role"] not in ROUTER_ROLES, (c["name"] or "").casefold()))
+    v = netview_of(owner)
+    out = {**v, "me": me, "candidates": cand}
+    if v["node"]:  # що відомо про вузол за зв'язками сьогодні: прямі сусіди й пакети
+        with db_lock:
+            rows = db.execute("SELECT src, dst, kind, n FROM link WHERE owner = ? AND day = ? AND (src = ? OR dst = ?)",
+                              (owner, day_of(), v["node"], v["node"])).fetchall()
+        direct = {(b if a == v["node"] else a) for a, b, kind, _n in rows if kind in ("direct", "relay")}
+        out["known"] = {"links": len(rows), "packets": sum(r[3] for r in rows), "direct": len(direct)}
+    return jsonify(out)
+
+
+@app.post("/api/netview")
+def api_netview_set():
+    d = body()
+    owner, i = cur_id(), cur_iface()
+    on, node = d.get("on"), d.get("node", netview_of(owner)["node"])
+    if not isinstance(on, bool):
+        return err("on: true або false")
+    if node is not None and not (isinstance(node, str) and re.fullmatch(r"![0-9a-f]{8}", node)):
+        return err("node: !xxxxxxxx")
+    if on and node is None:
+        return err("Оберіть вузол, з погляду якого показувати мережу")
+    if on and not any((n.get("user") or {}).get("id") == node for n in all_nodes(i)):
+        return err("Цей вузол панелі невідомий: його ще не чути в мережі")
+    allv = netview_all()
+    allv[owner] = {"on": on, "node": node}
+    try:
+        write_private(NETVIEW_FILE, json.dumps(allv, indent=1))
+    except OSError as e:
+        return err(f"не вдалося записати налаштування: {e.strerror or e}", 500)
+    return api_netview_get()
+
+
 @app.get("/api/mesh")
 def api_mesh():
     """Граф мережі за добу (?day=РРРР-ММ-ДД, типово сьогодні) і перелік діб з даними."""
@@ -2301,12 +2365,16 @@ def api_mesh():
         nid = (n.get("user") or {}).get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
         if nid:
             known[nid] = n
-    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    real_me = me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
     hidden = set() if with_mqtt else {nid for nid, n in known.items() if n.get("viaMqtt")}
     links = [{"a": a, "b": b, "flow": flow, "kind": kind, "n": n, "t": t,
               "snr": round(ss / sn, 1) if sn else None}
              for a, b, flow, kind, n, ss, sn, t in rows if a not in hidden and b not in hidden]
-    ids = {x for l in links for x in (l["a"], l["b"])} | ({me} if me else set())
+    view = netview_of(owner)
+    if view["on"] and view["node"] != me:  # «очима вузла»: центр карти — вибраний вузол, напрямки рахуємо відносно нього
+        me = view["node"]
+        links, _dist = extras.view_graph(links, me)
+    ids = {x for l in links for x in (l["a"], l["b"])} | ({me} if me else set()) | ({real_me} if real_me else set())
     repeaters = {l["a"] for l in links if l["kind"] == "relay"} | {l["b"] for l in links if l["kind"] == "via"}
     nodes = []
     for nid in sorted(ids):
@@ -2316,11 +2384,13 @@ def api_mesh():
         nodes.append({"id": nid, "name": u.get("longName") or nid, "short": u.get("shortName"), "role": role,
                       "repeater": role in ROUTER_ROLES or nid in repeaters, "me": nid == me,
                       "hw": u.get("hwModel"), "snr": n.get("snr"), "rssi": rssi.get((owner, nid)),
-                      "hops": n.get("hopsAway"), "mqtt": bool(n.get("viaMqtt")), "heard": n.get("lastHeard"),
+                      "hops": None if me != real_me else n.get("hopsAway"), "mqtt": bool(n.get("viaMqtt")), "heard": n.get("lastHeard"),
                       "lat": p.get("latitude"), "lon": p.get("longitude")})
     mine = next((n for n in nodes if n["me"] and n["lat"] is not None and n["lon"] is not None), None)
     origin = {"lat": mine["lat"], "lon": mine["lon"]} if mine else home()  # центр кілець відстані
     return jsonify({"day": day, "today": day_of(), "me": me, "origin": origin, "nodes": nodes, "links": links,
+                    "view": {"on": me != real_me, "node": me, "name": next((n["name"] for n in nodes if n["id"] == me), me),
+                             "real_me": real_me},
                     "days": [{"day": d, "packets": s, "links": c} for d, s, c in days]})
 
 

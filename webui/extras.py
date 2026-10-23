@@ -690,3 +690,29 @@ def solar_projection(points, cfg, soc_pct, now):
         out.update(min_pct=round(100 * low / cap, 1), min_at=low_t, empty_at=empty_t, risk=empty_t is not None,
                    end_pct=round(100 * soc / cap, 1))
     return out
+
+
+# ---- карта «очима вузла»: перерахунок графа зв'язків відносно іншого центра --------------------------------------------------
+def view_graph(links, center):
+    """links: [{a, b, flow, ...}] за добу; center: id вузла, з погляду якого дивимось на мережу. Відстані рахуємо за зв'язками без
+    урахування напрямку, а «вгору» тепер означає «ближче до центра», «вниз» «далі від нього»; зв'язки, у яких обидва кінці
+    однаково далеко чи недосяжні, лишають свій напрямок. -> (нові зв'язки, відстані {id: кроків від центра})."""
+    adj: dict[str, set] = {}
+    for l in links:
+        adj.setdefault(l["a"], set()).add(l["b"])
+        adj.setdefault(l["b"], set()).add(l["a"])
+    dist = {center: 0}
+    queue = [center]
+    for cur in queue:
+        for nb in adj.get(cur, ()):
+            if nb not in dist:
+                dist[nb] = dist[cur] + 1
+                queue.append(nb)
+    out = []
+    for l in links:
+        da, db_ = dist.get(l["a"]), dist.get(l["b"])
+        flow = l["flow"]
+        if da is not None and db_ is not None and da != db_:
+            flow = "up" if db_ < da else "down"
+        out.append({**l, "flow": flow})
+    return out, dist

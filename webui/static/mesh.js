@@ -488,10 +488,11 @@
       if (sel && !data.nodes.some(n => n.id === sel)) sel = null;
       fillDays(r.day);
       const pk = data.links.reduce((s, l) => s + l.n, 0);
-      ui.note.textContent = data.links.length
+      const vw = r.view && r.view.on ? `Погляд вузла «${r.view.name}»: ` : '';
+      ui.note.textContent = vw + (data.links.length
         ? `${data.nodes.length} вузлів · ${data.links.length} напрямків зв'язку · ${pk} пакетів за ${r.day}.` +
           (data.origin ? '' : ' Задайте розташування в «Налаштуваннях» — тоді вузли стануть за справжньою відстанню.')
-        : `За ${r.day} зв'язків ще немає: вони накопичуються з кожного прийнятого пакета.`;
+        : `За ${r.day} зв'язків ще немає: вони накопичуються з кожного прийнятого пакета.`);
       draw(); info(); routeTable(); table();
     } catch (e) { ui.note.textContent = e.message; }
   }
@@ -560,4 +561,5 @@
   loadTrace();
   setInterval(() => { if (!document.hidden) loadTrace(); }, 15000);
   setInterval(() => { if (!document.hidden && (!data || ui.day.value === data.today)) load(); }, 60000);
+  window.addEventListener('meshpi:mesh-reload', load);  // «Джерело даних карти» змінило центр
 })();

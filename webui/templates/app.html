@@ -151,6 +151,19 @@
 </section>
   </div>
   <div class="tabpane" data-tab="mesh" role="tabpanel" hidden>
+<section class="panel" id="viewbox">
+    <h2>Джерело даних карти</h2>
+    <p class="evnote">Типово карта показує мережу з погляду вашого вузла. Увімкніть, щоб вона показувала мережу <b>очима іншого вузла</b>, наприклад роутера, доступного лише по радіо: він стає центром, кола рахуються від нього, а «вгору» означає «ближче до нього». Дані беруться з усього, що панель чула: ретрансляції, відповіді «Маршрут» і NeighborInfo цього вузла. Без NeighborInfo на ньому картина неповна. Панель сама нічого на ньому не змінює.</p>
+    <div class="row" style="margin-bottom:8px">
+      <label><input type="checkbox" id="viewon"> дивитись очима вузла</label>
+      <select class="tg-input" id="viewnode" aria-label="Вузол-центр"></select>
+      <button type="button" id="viewsave" class="check-btn">💾 Застосувати</button>
+      <button type="button" id="viewask" class="check-btn" title="Надсилає вузлу запити «Маршрут» і «Показники» (передача в ефір)">📡 Запитати маршрут і дані</button>
+      <button type="button" id="viewnbr" class="check-btn" title="Читає налаштування NeighborInfo віддаленого вузла по радіо">🔎 NeighborInfo на вузлі</button>
+      <span id="viewnote" class="hint"></span>
+    </div>
+    <div id="viewinfo"></div>
+</section>
 <section class="panel">
     <h2>Карта мережі</h2>
     <div class="row" style="margin-bottom:8px">
@@ -1228,6 +1241,7 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/waypoints.js"></script>
 <script src="/static/events.js"></script>
 <script src="/static/health.js"></script>
+<script src="/static/netview.js"></script>
 <script src="/static/rangetest.js"></script>
 <script src="/static/plan.js"></script>
 <script src="/static/notify.js"></script>
