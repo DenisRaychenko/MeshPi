@@ -175,13 +175,23 @@
   button.reboot-btn:active {border-color:var(--crit); background:var(--btn-crit-active-bg);}
   button.reboot-btn:disabled {opacity:0.5; cursor:not-allowed;}
   .hint {font-family:var(--font-mono); font-size:0.68rem; color:var(--text-low);}
+  .leaflet-container {background:var(--sky-900);}  /* без плиток (немає інтернету) карта лишається темною, вузли видно */
   /* журнал подій: мітка виду (колір і слово), заголовки діб, непереглянуті рядки */
   .evk {display:inline-block; font-family:var(--font-mono); font-size:0.7rem; padding:2px 9px; border-radius:999px; border:1px solid var(--line); color:var(--text-hi); white-space:nowrap;}
   .evk.new {color:var(--signal); border-color:var(--signal-dim);}
   .evk.fav_off {color:var(--crit); border-color:var(--crit-border);}
   .evk.fav_on {color:var(--warn); border-color:var(--warn);}
+  .evk.bat_low, .evk.chan_high, .evk.reboot {color:var(--warn); border-color:var(--warn);}
+  .evk.link_lost {color:var(--crit); border-color:var(--crit-border);}
+  .evk.link_ok {color:var(--signal); border-color:var(--signal-dim);}
   tr.evday td {font-family:var(--font-mono); font-size:0.68rem; letter-spacing:.08em; text-transform:uppercase; color:var(--text-mid); padding-top:14px;}
   tr.evnew td:first-child {box-shadow:inset 3px 0 0 var(--signal);}
+
+  /* здоров'я мережі: рядки висновків за рівнем */
+  .hfind {display:flex; gap:10px; align-items:flex-start; padding:8px 12px; margin:0 0 6px; border:1px solid var(--line); border-left-width:4px; border-radius:8px; font-size:0.85rem; line-height:1.4;}
+  .hfind.ok {border-left-color:var(--signal);} .hfind.info {border-left-color:var(--text-low);}
+  .hfind.warn {border-left-color:var(--warn);} .hfind.crit {border-left-color:var(--crit);}
+  .hfind .lv {font-family:var(--font-mono); font-size:0.68rem; text-transform:uppercase; letter-spacing:.06em; min-width:5.5em; padding-top:2px; color:var(--text-mid);}
   .evnote {margin:0 0 10px; color:var(--text-mid); font-size:0.82rem; line-height:1.45;}
 
   button.check-btn:hover {border-color:var(--signal); background:var(--btn-signal-hover-bg);}

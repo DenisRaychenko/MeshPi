@@ -25,8 +25,10 @@ from urllib.parse import quote
 import secrets
 
 import admin
+import extras
+import notify
 import segno
-from flask import Flask, Response, has_request_context, jsonify, redirect, render_template, request, session
+from flask import Flask, Response, g, has_request_context, jsonify, redirect, render_template, request, session
 from google.protobuf.message import DecodeError  # type: ignore[import-untyped]
 from meshtastic.protobuf import apponly_pb2, channel_pb2, config_pb2, mesh_pb2, portnums_pb2, telemetry_pb2
 from meshtastic.tcp_interface import TCPInterface
@@ -38,6 +40,15 @@ MESH_HOST = os.environ.get("MESH_HOST", "localhost")
 # для ненадійної мережі — файрвол
 MESH_PORT = int(os.environ.get("MESH_PORT", "4404"))  # проксі (proxy.py); напряму до meshtasticd — 4403
 USER = os.environ.get("MESHPI_USER", "admin")
+# підкладка карт: типово плитки OpenStreetMap (потрібен інтернет); для роботи без нього вкажіть власний сервер плиток
+# (tileserver-gl, PMTiles за проксі…) у MESHPI_TILE_URL, наприклад http://10.10.92.30:8081/tiles/{z}/{x}/{y}.png
+TILE_URL = os.environ.get("MESHPI_TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+TILE_ATTR = os.environ.get("MESHPI_TILE_ATTR", "© OpenStreetMap")
+TILE_ZOOM = min(max(int(os.environ.get("MESHPI_TILE_ZOOM", "19")), 1), 22) if os.environ.get("MESHPI_TILE_ZOOM", "19").isdigit() else 19
+if not re.match(r"^https?://[^\s'\"<>]+$", TILE_URL) or "{z}" not in TILE_URL:
+    TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"  # зіпсована змінна не має ламати сторінку
+VIEWER_USER = os.environ.get("MESHPI_VIEWER_USER", "viewer")  # друга роль «лише перегляд»: бачить карту, чат, події, але нічого не змінює
+VIEWER_PASSWORD = os.environ.get("MESHPI_VIEWER_PASSWORD", "")
 PASSWORD = os.environ.get("MESHPI_PASSWORD", "")
 DB_PATH = os.environ.get("MESHPI_DB", "messages.db")
 # пароль, змінений в інтерфейсі (scrypt-хеш); /etc/meshpi.env доступний сервісу лише для читання
@@ -172,6 +183,12 @@ def init_db(path):
                " kind TEXT, node TEXT, text TEXT)")
     db.execute("CREATE INDEX IF NOT EXISTS event_owner ON event (owner, id)")
     db.execute("CREATE TABLE IF NOT EXISTS seen (owner TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY (owner, node))")
+    # вимір дальності (Range Test): кожен прийнятий пакет «seq N» із SNR/RSSI і відстанню до відправника
+    db.execute("CREATE TABLE IF NOT EXISTS rangetest (owner TEXT NOT NULL, t INT, node TEXT, seq INT, snr REAL, rssi REAL, hops INT,"
+               " lat REAL, lon REAL, dist REAL)")
+    db.execute("CREATE INDEX IF NOT EXISTS rangetest_owner ON rangetest (owner, t)")
+    # журнал дій: хто й звідки що змінив (без тіл запитів), 2000 останніх рядків
+    db.execute("CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, t INT, role TEXT, user TEXT, ip TEXT, action TEXT)")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
     # ack: статус доставки приватного повідомлення — 0 надіслано, 1 хтось ретранслював, 2 дійшло до адресата, 3 помилка
@@ -403,6 +420,83 @@ def pw_ok(pw):
     return ok
 
 
+VIEWER_PWFILE = os.environ.get("MESHPI_VIEWER_PWFILE", str(Path(DB_PATH).with_name("viewerpw")))
+_good_viewer: bytes | None = None
+
+
+def viewer_on():
+    return bool(VIEWER_PASSWORD or Path(VIEWER_PWFILE).exists())
+
+
+def viewer_pw_ok(pw):
+    """Той самий scrypt і той самий ліміт спроб, що й для адміністратора; пароль глядача лежить в окремому файлі."""
+    global _good_viewer
+    d = hashlib.sha256(pw.encode()).digest()
+    if _good_viewer is not None and hmac.compare_digest(d, _good_viewer):
+        return True
+    if len(_fails) == _fails.maxlen and time.time() - _fails[0] < 60:
+        return False
+    try:
+        salt, h = Path(VIEWER_PWFILE).read_text().strip().split("$")
+        ok = hmac.compare_digest(_scrypt(pw, bytes.fromhex(salt)), h)
+    except FileNotFoundError:
+        ok = bool(VIEWER_PASSWORD) and _eq(pw, VIEWER_PASSWORD)
+    except (OSError, ValueError):
+        return False
+    if ok:
+        _good_viewer = d
+    else:
+        _fails.append(time.time())
+    return ok
+
+
+def _viewer_stamp():
+    try:
+        pw = Path(VIEWER_PWFILE).read_text()
+    except OSError:
+        pw = VIEWER_PASSWORD
+    return hashlib.sha256(("meshpi-viewer:" + pw).encode()).hexdigest()[:16]
+
+
+# що може глядач: лише ці GET (перелік дозволеного, а не заборонного: новий маршрут за замовчуванням закритий) і вибір вузла
+VIEWER_GET = {"/", "/settings", "/api/whoami", "/api/status", "/api/nodes", "/api/messages", "/api/mesh", "/api/telemetry",
+              "/api/history", "/api/env", "/api/events", "/api/netstats", "/api/health", "/api/waypoints", "/api/packets",
+              "/api/packets.csv", "/api/conns", "/api/rangetest", "/api/rangetest.csv"}
+
+
+def viewer_allowed(method, path):
+    if method in ("GET", "HEAD"):
+        return path in VIEWER_GET
+    if path == "/logout":
+        return True
+    if path == "/api/conns" and method == "POST":  # лише вибір вузла в цій сесії; додавати й міняти вузли не можна
+        d = request.get_json(silent=True)
+        return isinstance(d, dict) and d.get("action") == "select"
+    return False
+
+
+def conn_list():
+    """Список підключень для браузера; глядач бачить лише назви й стан, без адрес вузлів і агентів."""
+    if g.get("role") == "viewer":
+        return [{"id": c.id, "name": c.name, "online": c.iface is not None} for c in conns.values()]
+    return [c.public() for c in conns.values()]
+
+
+def audit(action, user="", t=None, role=None):
+    """Рядок у журнал дій: хто (роль, ім'я), звідки, що. Тіла запитів і паролі туди не потрапляють."""
+    if "db" not in globals():  # база ще не відкрита (деякі тести перевіряють лише вхід)
+        return
+    role = role or (g.get("role") if has_request_context() else None)
+    ip = request.remote_addr if has_request_context() else ""
+    try:
+        with db_lock, db:
+            db.execute("INSERT INTO audit (t, role, user, ip, action) VALUES (?,?,?,?,?)",
+                       (int(t or time.time()), role or "", user[:40], (ip or "")[:45], action[:200]))
+            db.execute("DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY id DESC LIMIT 2000)")
+    except sqlite3.Error:
+        log.exception("журнал дій")
+
+
 def auth_on():
     """Чи питати пароль: його задано (env або змінений у інтерфейсі) і вхід без пароля не ввімкнено."""
     return bool(PASSWORD or Path(PWFILE).exists()) and not Path(NOAUTHFILE).exists()
@@ -423,15 +517,31 @@ def _safe_next(n):
 
 @app.before_request
 def check_auth():
+    g.role, g.user = "admin", ""
     if not auth_on():
         return None
     if request.path in ("/login", "/logout") or request.path.startswith("/static/"):
+        g.role = None  # ще не відомо, хто це (для /login) або вже виходить: у журнал іде без ролі
         return None
-    if session.get("ok") and hmac.compare_digest(str(session.get("stamp", "")), _auth_stamp()):
+    role = None
+    if session.get("ok"):
+        want = session.get("role", "admin")
+        if want == "admin" and hmac.compare_digest(str(session.get("stamp", "")), _auth_stamp()):
+            role = "admin"
+        elif want == "viewer" and viewer_on() and hmac.compare_digest(str(session.get("stamp", "")), _viewer_stamp()):
+            role = "viewer"
+    if role is None:
+        a = request.authorization  # Basic залишено для скриптів і curl; вікно пароля браузер більше не показує
+        if a and _eq(a.username, USER) and pw_ok(a.password or ""):
+            role = "admin"
+        elif a and viewer_on() and _eq(a.username, VIEWER_USER) and viewer_pw_ok(a.password or ""):
+            role = "viewer"
+    if role:
+        g.role, g.user = role, USER if role == "admin" else VIEWER_USER
+        if role == "viewer" and not viewer_allowed(request.method, request.path):
+            return jsonify(error="Режим «лише перегляд»: ця дія недоступна"), 403
         return None
-    a = request.authorization  # Basic залишено для скриптів і curl; вікно пароля браузер більше не показує
-    if a and _eq(a.username, USER) and pw_ok(a.password or ""):
-        return None
+    g.role = None  # не увійшов
     if request.path.startswith("/api/"):
         return jsonify(error="Потрібен вхід"), 401
     nxt = request.full_path.rstrip("?")
@@ -448,12 +558,22 @@ def login():
         if len(_fails) == _fails.maxlen and time.time() - _fails[0] < 60:
             return render_template("login.html", error="Забагато невдалих спроб, зачекайте хвилину",
                                    next=nxt, user=user), 429
-        if _eq(user, USER) and pw_ok(request.form.get("password", "")):
+        pw = request.form.get("password", "")
+        if _eq(user, USER) and pw_ok(pw):
             session.clear()
-            session["ok"] = True
-            session["stamp"] = _auth_stamp()
+            session["ok"], session["role"], session["stamp"] = True, "admin", _auth_stamp()
             session.permanent = True
+            g.role = "admin"
+            audit("вхід", USER)
             return redirect(nxt)
+        if viewer_on() and _eq(user, VIEWER_USER) and viewer_pw_ok(pw):
+            session.clear()
+            session["ok"], session["role"], session["stamp"] = True, "viewer", _viewer_stamp()
+            session.permanent = True
+            g.role = "viewer"
+            audit("вхід", VIEWER_USER)
+            return redirect(nxt)
+        audit("невдалий вхід", user)
         return render_template("login.html", error="Невірний користувач або пароль", next=nxt, user=user), 401
     return render_template("login.html", error=None, next=nxt, user="")
 
@@ -462,6 +582,22 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
+
+
+@app.after_request
+def audit_actions(resp):
+    """Кожна дія, що щось міняє (не GET), і кожна відмова глядачеві потрапляє в журнал дій."""
+    try:
+        if request.path.startswith("/static/") or request.path in ("/login",):
+            return resp
+        viewer = g.get("role") == "viewer"
+        if viewer and resp.status_code != 403:
+            return resp  # дозволене глядачеві (вибір вузла, вихід) у журнал не пишемо
+        if request.method not in ("GET", "HEAD", "OPTIONS"):  # закриті GET глядача (їх опитує сторінка) не пишемо: це шум
+            audit(f"{request.method} {request.path} → {resp.status_code}", g.get("user", ""))
+    except Exception:  # noqa: BLE001
+        pass
+    return resp
 
 
 @app.after_request
@@ -526,6 +662,8 @@ def on_text(packet, interface):
                   int(bool(dec.get("emoji"))), owner=owner_of(interface))
     if not mine and new and dec["text"].strip().casefold() in PING_WORDS:
         pong(packet, interface)
+    if not mine and new:
+        _quiet(lambda: auto_on_text(packet, interface))
 
 
 pong_last: dict[tuple, float] = {}  # (підключення, вузол) -> час останньої відповіді
@@ -743,6 +881,11 @@ def record_tele(packet, owner=None):
             v = (block or {}).get(key)
             if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and lo <= v <= hi:
                 vals.append((sid, float(v) / 3600 if sid == "up" else float(v)))
+    local = tel.get("localStats") or {}  # лічильники самого вузла (див. extras.health_report)
+    for key, sid in extras.LOCAL_KEYS.items():
+        v = local.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and -300 <= v <= 1e10:
+            vals.append((sid, float(v)))
     if not vals:
         return
     now = int(time.time())
@@ -768,6 +911,34 @@ def thin(points, limit=240):
     for t, v in points:
         buckets.setdefault(int((t - t0) / step), []).append((t, v))
     return [[sum(t for t, _ in b) // len(b), sum(v for _, v in b) / len(b)] for _, b in sorted(buckets.items())]
+
+
+@app.get("/api/netstats")
+def api_netstats():
+    """Здоров'я мережі за лічильниками LocalStats вибраного вузла (?hours=1..168, типово 24) і висновки з них."""
+    try:
+        hours = min(max(int(request.args.get("hours", 24)), 1), 168)
+    except ValueError:
+        return err("hours: число")
+    i, owner, now = cur_iface(), cur_id(), int(time.time())
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    if not me:
+        return err("meshtasticd недоступний", 503)
+    with db_lock:
+        rows = db.execute("SELECT k, t, v FROM tele WHERE owner = ? AND node = ? AND t >= ? AND (k LIKE 'ls\\_%' ESCAPE '\\'"
+                          " OR k = 'chan') ORDER BY t", (owner, me, now - hours * 3600)).fetchall()
+        own = db.execute("SELECT t, chan FROM metric WHERE owner = ? AND t >= ? AND chan IS NOT NULL ORDER BY t",
+                         (owner, now - hours * 3600)).fetchall()
+    series: dict[str, list] = {}
+    for k, t, v in rows:
+        series.setdefault(k, []).append([t, v])
+    if own and "chan" not in series:  # власні виміри панелі щільніші за телеметрію
+        series["chan"] = [[t, c] for t, c in own]
+    rep = extras.health_report(series, now)
+    rep["hours"] = hours
+    for k in ("dup", "bad", "chan", "noise"):
+        rep["series"][k] = thin(rep["series"][k], 120)
+    return jsonify(rep)
 
 
 @app.get("/api/telemetry")
@@ -932,7 +1103,7 @@ def record_trace(data, owner=None):
                 add_link(a["id"], b["id"], flow, "direct", b.get("snr"), owner=owner)
 
 
-PKT_LOG = 300  # скільки останніх пакетів тримати в пам'яті для «Журналу пакетів» (на кожне підключення)
+PKT_LOG = int(os.environ.get("MESHPI_PKT_LOG", "1000"))  # скільки останніх пакетів тримати в пам'яті для «Журналу пакетів» (на кожне підключення)
 pkt_log: dict[str, collections.deque] = {}
 
 
@@ -955,10 +1126,27 @@ def api_packets():
     except ValueError:
         return err("limit: число")
     i = cur_iface()
-    rows = list(pkt_log.get(cur_id(), ()))[::-1][:n]
+    try:
+        rows = extras.filter_packets(list(pkt_log.get(cur_id(), ()))[::-1], request.args)[:n]
+    except ValueError as e:
+        return err(str(e))
     for r in rows:
         r["from_name"] = node_name(i, r["from"]) if i and r["from"] else None
     return jsonify(rows)
+
+
+@app.get("/api/packets.csv")
+def api_packets_csv():
+    """Той самий журнал із тими самими фільтрами файлом CSV (UTF-8 з BOM, захист від формул)."""
+    i = cur_iface()
+    try:
+        rows = extras.filter_packets(list(pkt_log.get(cur_id(), ()))[::-1], request.args)
+    except ValueError as e:
+        return err(str(e))
+    rows = [dict(r, from_name=node_name(i, r["from"]) if i and r["from"] else None) for r in rows]
+    name = time.strftime("meshpi-packets-%Y%m%d-%H%M.csv")
+    return Response(extras.packets_csv(rows), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
 
 
 def on_packet(packet, interface):
@@ -967,6 +1155,7 @@ def on_packet(packet, interface):
     _quiet(lambda: record_env(packet, owner))
     _quiet(lambda: record_tele(packet, owner))
     _quiet(lambda: record_waypoint(packet, owner))
+    _quiet(lambda: record_range(packet, owner, interface))
     _quiet(lambda: record_link(packet, interface))
     _quiet(flush_links)
     if packet.get("rxRssi") is not None and sender_of(packet):
@@ -1016,12 +1205,448 @@ EV_KEEP = 500       # подій на підключення; старіші в�
 ev_state: dict[tuple, str] = {}  # (підключення, вузол) -> "off" | "on": пам'ять детектора обраних
 
 
+NOTIFY_FILE = os.environ.get("MESHPI_NOTIFY_FILE", str(Path(DB_PATH).with_name("notify.json")))  # токени каналів, права 600
+notify_cfg = notify.load(NOTIFY_FILE)
+ALERT_LEVEL = {"fav_off": "warn", "bat_low": "warn", "chan_high": "warn", "reboot": "warn", "link_lost": "crit"}
+alert_state: dict[str, dict] = {}  # пам'ять порогових тривог по підключеннях (extras.alerts)
+
+
 def add_event(owner, kind, node, text, t=None):
     with db_lock, db:
         db.execute("INSERT INTO event (owner, t, kind, node, text) VALUES (?,?,?,?,?)",
                    (owner, int(t or time.time()), kind, node, text[:200]))
         db.execute("DELETE FROM event WHERE owner = ? AND id NOT IN (SELECT id FROM event WHERE owner = ?"
                    " ORDER BY id DESC LIMIT ?)", (owner, owner, EV_KEEP))
+    cfg = notify_cfg
+    if cfg["kinds"].get(kind) and any(cfg[ch]["on"] for ch in ("telegram", "ntfy", "webhook")):
+        c = conns.get(owner)
+        notify.send_async(cfg, f"Meshpi · {c.name}" if c else "Meshpi", text, ALERT_LEVEL.get(kind, "info"), log)
+
+
+def alerts_tick(c, now=None):
+    """Порогові тривоги: зв'язок із вузлом, перезапуск, низький заряд свого вузла й обраних, перевантажений ефір."""
+    i, now = c.iface, now or time.time()
+    snap = {"online": i is not None, "me": None, "favs": [], "chan": []}
+    if i is not None:
+        try:
+            me = i.getMyNodeInfo() or {}
+        except Exception:  # noqa: BLE001
+            me = {}
+        u, dm = me.get("user") or {}, me.get("deviceMetrics") or {}
+        snap["me"] = {"id": u.get("id"), "name": u.get("shortName") or u.get("longName"),
+                      "battery": dm.get("batteryLevel"), "uptime": dm.get("uptimeSeconds")}
+        for n in all_nodes(i):
+            nu = n.get("user") or {}
+            if n.get("isFavorite") and nu.get("id") and nu.get("id") != u.get("id"):
+                snap["favs"].append({"id": nu["id"], "name": nu.get("shortName") or nu.get("longName"),
+                                     "battery": (n.get("deviceMetrics") or {}).get("batteryLevel")})
+        with db_lock:
+            rows = db.execute("SELECT chan FROM metric WHERE owner = ? AND chan IS NOT NULL ORDER BY t DESC LIMIT 3", (c.id,)).fetchall()
+        snap["chan"] = [r[0] for r in reversed(rows)]
+    for kind, node, text in extras.alerts(alert_state.setdefault(c.id, {}), snap, notify_cfg["rules"], now):
+        add_event(c.id, kind, node or "", text, now)
+
+
+@app.get("/api/security")
+def api_security():
+    """Перевірка безпеки вибраного вузла й відомих йому вузлів (лише читання; секретні ключі не читаються)."""
+    i = need()
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
+    nodes = []
+    for n in all_nodes(i):
+        u = n.get("user") or {}
+        nid = u.get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        if nid:
+            key = u.get("publicKey")
+            nodes.append({"id": nid, "name": u.get("shortName") or u.get("longName") or nid,
+                          "key": key if isinstance(key, str) else "", "mqtt": bool(n.get("viaMqtt"))})
+    ln = i.localNode
+    chans = []
+    for ch in getattr(ln, "channels", None) or []:
+        try:
+            chans.append({"index": ch.index, "name": ch.settings.name, "role": channel_pb2.Channel.Role.Name(ch.role),
+                          "psk": bytes(ch.settings.psk), "uplink": ch.settings.uplink_enabled,
+                          "downlink": ch.settings.downlink_enabled,
+                          "precision": ch.settings.module_settings.position_precision})
+        except (AttributeError, ValueError):
+            continue
+    try:
+        sec, lora, mq = ln.localConfig.security, ln.localConfig.lora, ln.moduleConfig.mqtt
+        cfg = {"mqtt_on": bool(mq.enabled), "ok_to_mqtt": bool(lora.config_ok_to_mqtt), "admin_keys": len(sec.admin_key),
+               "admin_channel": bool(sec.admin_channel_enabled), "managed": bool(sec.is_managed)}
+    except AttributeError:
+        cfg = {}
+    return jsonify(extras.security_audit(nodes, me, chans, cfg))
+
+
+RANGE_KEEP = 14 * 86400
+
+
+def record_range(packet, owner, i):
+    """Пакет вимірювання дальності від іншого вузла: зберегти SNR/RSSI і відстань до нього від нашої позиції."""
+    seq = extras.range_seq(packet)
+    num = packet.get("from")
+    if seq is None or not isinstance(num, int) or i is None:
+        return
+    sender = ((getattr(i, "nodesByNum", None) or {}).get(num) or {}).get("position")
+    mine = (i.getMyNodeInfo() or {}).get("position")
+    r = extras.range_row(packet, seq, sender, mine)
+    with db_lock, db:
+        db.execute("INSERT INTO rangetest (owner, t, node, seq, snr, rssi, hops, lat, lon, dist) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (owner, r["t"], r["node"], r["seq"], r["snr"], r["rssi"], r["hops"], r["lat"], r["lon"], r["dist"]))
+        db.execute("DELETE FROM rangetest WHERE owner = ? AND t < ?", (owner, int(time.time()) - RANGE_KEEP))
+
+
+def range_rows(owner, hours):
+    with db_lock:
+        rows = db.execute("SELECT t, node, seq, snr, rssi, hops, lat, lon, dist FROM rangetest WHERE owner = ? AND t >= ? ORDER BY t",
+                          (owner, int(time.time()) - hours * 3600)).fetchall()
+    return [dict(zip(extras.RANGE_FIELDS, r)) for r in rows]
+
+
+@app.get("/api/rangetest")
+def api_rangetest():
+    """Результати Range Test за ?hours=1..336 (типово 24): підсумок по відправниках і точки «відстань, SNR» для графіка."""
+    try:
+        hours = min(max(int(request.args.get("hours", 24)), 1), 336)
+    except ValueError:
+        return err("hours: число")
+    rows = range_rows(cur_id(), hours)
+    i = cur_iface()
+    names = {r["node"]: node_name(i, r["node"]) for r in rows} if i else {}
+    pts = [[r["dist"], r["snr"], r["node"]] for r in rows if r["dist"] is not None and r["snr"] is not None]
+    return jsonify(hours=hours, total=len(rows), nodes=[{**x, "name": names.get(x["node"], x["node"])} for x in extras.range_summary(rows)],
+                   points=pts[-1500:])
+
+
+@app.get("/api/rangetest.csv")
+def api_rangetest_csv():
+    try:
+        hours = min(max(int(request.args.get("hours", 24)), 1), 336)
+    except ValueError:
+        return err("hours: число")
+    rows = range_rows(cur_id(), hours)
+    i = cur_iface()
+    names = {r["node"]: node_name(i, r["node"]) for r in rows} if i else {}
+    name = time.strftime("meshpi-rangetest-%Y%m%d-%H%M.csv")
+    return Response(extras.range_csv(rows, names), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
+
+# ---- автовідповідач і заплановані оголошення (extras.auto_*) ----
+AUTO_FILE = os.environ.get("MESHPI_AUTO_FILE", str(Path(DB_PATH).with_name("auto.json")))
+AUTO_STATE_FILE = str(Path(AUTO_FILE).with_name("auto_state.json"))  # коли й скільки передано: переживає перезапуск, щоб не бити ліміти
+auto_lock = threading.Lock()
+
+
+def auto_load():
+    try:
+        raw = json.loads(Path(AUTO_FILE).read_text())
+    except (OSError, ValueError):
+        return extras.auto_defaults()
+    cfg, why = extras.auto_update(extras.auto_defaults(), raw if isinstance(raw, dict) else {})
+    return cfg if not why else extras.auto_defaults()
+
+
+def auto_state_load():
+    try:
+        st = json.loads(Path(AUTO_STATE_FILE).read_text())
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+auto_cfg = auto_load()
+auto_state: dict = auto_state_load()
+
+
+def auto_ctx(i, owner, per_hour=6):
+    """Підстановки й показники для автоматики: зайнятість каналу, скільки вузлів чутно за годину, свій заряд, датчики довкілля."""
+    now = time.time()
+    me = i.getMyNodeInfo() or {}
+    mid = (me.get("user") or {}).get("id")
+    nodes = all_nodes(i)
+    with db_lock:
+        row = db.execute("SELECT chan FROM metric WHERE owner = ? AND chan IS NOT NULL ORDER BY t DESC LIMIT 1", (owner,)).fetchone()
+        env = dict(db.execute("SELECT k, v FROM env WHERE owner = ? AND node = ? AND t >= ? ORDER BY t", (owner, mid, int(now) - 6 * 3600)).fetchall())
+    r1 = lambda v: None if not isinstance(v, (int, float)) else round(v, 1)  # noqa: E731
+    bat = (me.get("deviceMetrics") or {}).get("batteryLevel")
+    return {"chan": row[0] if row else None, "per_hour": per_hour, "nodes": sum(1 for n in nodes if now - (n.get("lastHeard") or 0) < 3600
+                                                                               and (n.get("user") or {}).get("id") != mid),
+            "bat": None if not isinstance(bat, (int, float)) or bat > 100 else f"{bat:.0f}%", "time": time.strftime("%H:%M"),
+            "temp": r1(env.get("temperature")), "hum": r1(env.get("humidity")), "press": r1(env.get("pressure")),
+            "local_ids": {((c.iface.getMyNodeInfo() or {}).get("user") or {}).get("id") for c in conns.values() if c.iface}}
+
+
+def auto_save_state():
+    try:
+        write_private(AUTO_STATE_FILE, json.dumps(auto_state))
+    except OSError:
+        log.exception("стан автоматики")
+
+
+def auto_transmit(i, owner, text, to, ch, reply=None, why=""):
+    p = send_text(i, text, to, ch, reply)
+    add_msg(None, "Ви", to, ch, text, None, 1, getattr(p, "id", None) or None, reply, owner=owner)
+    audit(f"автоматика → {to}: {text[:120]}" + (f" ({why})" if why else ""), "", role="система")
+
+
+def auto_on_text(packet, i):
+    """Вхідний текст -> можлива відповідь за правилами. Викликається з потоку прийому: передача йде окремим потоком."""
+    if not auto_cfg["reply"]["on"]:
+        return
+    sender, owner = sender_of(packet), owner_of(i)
+    dec = packet.get("decoded") or {}
+    mid = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
+    word = (str(dec.get("text") or "").strip().split() or [""])[0].casefold()
+    if Path(PONGFILE).exists() and word in PING_WORDS:
+        return  # «ping» уже обробляє проста автовідповідь PONG: не відповідаємо двічі
+    hs = packet.get("hopStart")
+    msg = {"text": str(dec.get("text") or ""), "sender": sender, "sender_name": node_name(i, sender) if sender else None,
+           "dm": dest_of(packet) == mid, "mqtt": bool(packet.get("viaMqtt")), "own": sender == mid, "t": packet.get("rxTime"),
+           "hops": hs - (packet.get("hopLimit") or 0) if hs else None, "snr": packet.get("rxSnr"), "rssi": packet.get("rxRssi")}
+    with auto_lock:
+        text, why = extras.auto_reply(auto_cfg, auto_state, msg, auto_ctx(i, owner, auto_cfg["reply"]["per_hour"]))
+        if text:
+            auto_save_state()
+    if not text:
+        return
+    to, ch = (sender if msg["dm"] else "^all"), packet.get("channel", 0)
+    threading.Thread(target=lambda: _quiet(lambda: auto_transmit(i, owner, text, to, ch, packet.get("id"), "відповідь")), daemon=True).start()
+
+
+def auto_tick(c, now=None):
+    """Заплановані оголошення: не більше одного за крок, лише коли є зв'язок із вузлом."""
+    i = c.iface
+    if i is None or not auto_cfg["announce"]["on"]:
+        return
+    with auto_lock:
+        due = extras.auto_due(auto_cfg, auto_state, auto_ctx(i, c.id), now)
+        if due:
+            auto_save_state()
+    for it, text in due:
+        auto_transmit(i, c.id, text, "^all", it["ch"], None, f"оголошення {it['id']}")
+
+
+@app.get("/api/auto")
+def api_auto_get():
+    with auto_lock:
+        sent = len([t for t in auto_state.get("sent", []) if time.time() - t < 3600])
+    return jsonify(cfg=auto_cfg, sent_last_hour=sent, placeholders=list(extras.PLACEHOLDERS), prefix=extras.BOT_PREFIX,
+                   limits={"cooldown_min": 60, "every_min": 60, "text_bytes": extras.AUTO_TEXT_BYTES})
+
+
+@app.post("/api/auto")
+def api_auto_set():
+    global auto_cfg
+    new, why = extras.auto_update(auto_cfg, request.get_json(silent=True))
+    if why:
+        return err(why)
+    try:
+        write_private(AUTO_FILE, json.dumps(new, ensure_ascii=False, indent=1))
+    except OSError as e:
+        return err(f"не вдалося записати налаштування: {e.strerror or e}", 500)
+    with auto_lock:
+        auto_cfg = new
+    return api_auto_get()
+
+
+# ---- зовнішні служби лише за вашою командою: висоти рельєфу (Open-Meteo) і прогноз сонця (forecast.solar) ----
+# Координати при цьому йдуть стороннім серверам, тому викликається тільки з кнопки; MESHPI_NO_EXTERNAL=1 вимикає це зовсім.
+NO_EXTERNAL = os.environ.get("MESHPI_NO_EXTERNAL") == "1"
+ELEVATION_URL = os.environ.get("MESHPI_ELEVATION_URL", "https://api.open-meteo.com/v1/elevation")
+SOLAR_URL = os.environ.get("MESHPI_SOLAR_URL", "https://api.forecast.solar/estimate")
+SOLAR_FILE = os.environ.get("MESHPI_SOLAR_FILE", str(Path(DB_PATH).with_name("solar.json")))
+ext_cache: dict[str, tuple[float, object]] = {}
+
+
+class _NoRedirectExt(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def fetch_json(url, timeout=10, limit=400_000):
+    """GET JSON зі стороннього сервера: без редиректів, із таймаутом і обмеженням розміру відповіді."""
+    req = urllib.request.Request(url, headers={"User-Agent": "meshpi (self-hosted; github.com/denisraychenko/meshpi)", "Accept": "application/json"})
+    with urllib.request.build_opener(_NoRedirectExt).open(req, timeout=timeout) as r:
+        raw = r.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("відповідь завелика")
+    return json.loads(raw)
+
+
+def cached(key, ttl, fn):
+    now = time.time()
+    hit = ext_cache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    if len(ext_cache) > 100:
+        ext_cache.clear()
+    ext_cache[key] = (now, val)
+    return val
+
+
+def node_pos(i, ident):
+    for n in all_nodes(i):
+        if (n.get("user") or {}).get("id") == ident:
+            p = n.get("position") or {}
+            if p.get("latitude") is not None and p.get("longitude") is not None:
+                return float(p["latitude"]), float(p["longitude"]), (n.get("user") or {}).get("shortName") or ident
+    return None
+
+
+@app.get("/api/linkplan")
+def api_linkplan():
+    """Планувальник лінка між двома вузлами (?a=!id&b=!id): профіль рельєфу, пряма видимість, зона Френеля, бюджет лінка.
+    Висоти рельєфу беруться з open-meteo.com (координати вузлів йдуть туди). Параметри: h1,h2 — висота антен, м; freq — МГц;
+    tx — потужність, дБм; g1,g2 — підсилення антен, дБі; bw — смуга, кГц; snr — поріг SNR пресету, дБ."""
+    if NO_EXTERNAL:
+        return err("Зовнішні запити вимкнено (MESHPI_NO_EXTERNAL=1)", 403)
+    i = need()
+    a, b = request.args.get("a", ""), request.args.get("b", "")
+    pa, pb = node_pos(i, a), node_pos(i, b)
+    if not pa or not pb or a == b:
+        return err("Оберіть два різні вузли, у яких відома позиція")
+    try:
+        q = {k: float(request.args.get(k, d)) for k, d in (("h1", 3), ("h2", 3), ("freq", 433.5), ("tx", 10), ("g1", 2), ("g2", 2), ("bw", 250), ("snr", -17.5))}
+    except ValueError:
+        return err("Параметри мають бути числами")
+    if not (0 <= q["h1"] <= 200 and 0 <= q["h2"] <= 200 and 100 <= q["freq"] <= 1000 and -10 <= q["tx"] <= 40 and -5 <= q["g1"] <= 30
+            and -5 <= q["g2"] <= 30 and 7.8 <= q["bw"] <= 500 and -30 <= q["snr"] <= 0):
+        return err("Параметри поза межами: висота 0–200 м, частота 100–1000 МГц, потужність −10…40 дБм, підсилення −5…30 дБі, смуга 7,8–500 кГц, SNR −30…0 дБ")
+    dist = extras.haversine_km(pa[0], pa[1], pb[0], pb[1])
+    if dist < 0.05 or dist > 200:
+        return err("Відстань має бути від 50 м до 200 км")
+    n = min(100, max(10, int(dist / 0.2) + 2))
+    pts = extras.sample_points(pa[0], pa[1], pb[0], pb[1], n)
+    url = ELEVATION_URL + "?latitude=" + ",".join(f"{p[0]:.5f}" for p in pts) + "&longitude=" + ",".join(f"{p[1]:.5f}" for p in pts)
+    try:
+        js = cached("elev:" + url, 86400, lambda: fetch_json(url))
+        elev = js["elevation"]
+        if not isinstance(elev, list) or len(elev) != n or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in elev):
+            raise ValueError("несподівана відповідь")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return err(f"Не вдалося отримати висоти рельєфу: {str(getattr(e, 'reason', e))[:100]}", 502)
+    prof = extras.link_profile(elev, dist, q["h1"], q["h2"], q["freq"])
+    bud = extras.link_budget(dist, q["freq"], q["tx"], q["g1"], q["g2"], q["bw"], q["snr"])
+    return jsonify(a={"id": a, "name": pa[2], "lat": pa[0], "lon": pa[1]}, b={"id": b, "name": pb[2], "lat": pb[0], "lon": pb[1]},
+                   profile=prof, budget=bud, params=q, source="Copernicus DEM GLO-90 через Open-Meteo (90 м)")
+
+
+def solar_all():
+    try:
+        d = json.loads(Path(SOLAR_FILE).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@app.get("/api/solar")
+def api_solar_get():
+    """Налаштування сонячної панелі вибраного вузла й (за ?forecast=1) прогноз forecast.solar із запасом акумулятора."""
+    owner = cur_id()
+    cfg = {**extras.solar_defaults(), **(solar_all().get(owner) or {})}
+    out = {"cfg": cfg, "external": not NO_EXTERNAL}
+    i = cur_iface()
+    me = (i.getMyNodeInfo() or {}) if i else {}
+    pos = me.get("position") or {}
+    out["node_pos"] = {"lat": pos.get("latitude"), "lon": pos.get("longitude")} if pos.get("latitude") is not None else None
+    bat = (me.get("deviceMetrics") or {}).get("batteryLevel")
+    out["battery"] = bat if isinstance(bat, (int, float)) and bat <= 100 else None
+    if request.args.get("forecast") == "1" and cfg["on"] and not NO_EXTERNAL:
+        url = f"{SOLAR_URL}/{cfg['lat']:.4f}/{cfg['lon']:.4f}/{cfg['dec']}/{cfg['az']}/{cfg['kwp']}"
+        try:
+            js = cached("solar:" + url, 3600, lambda: fetch_json(url))
+            points, days, left = extras.parse_forecast(js)
+            out["forecast"] = {**extras.solar_projection(points, cfg, out["battery"], time.time()), "days": days, "requests_left": left}
+        except urllib.error.HTTPError as e:
+            out["forecast"] = {"ok": False, "error": "забагато запитів до forecast.solar (12 на годину)" if e.code == 429 else f"forecast.solar: HTTP {e.code}"}
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            out["forecast"] = {"ok": False, "error": f"не вдалося отримати прогноз: {str(getattr(e, 'reason', e))[:100]}"}
+    return jsonify(out)
+
+
+@app.post("/api/solar")
+def api_solar_set():
+    owner = cur_id()
+    allc = solar_all()
+    new, why = extras.solar_update({**extras.solar_defaults(), **(allc.get(owner) or {})}, request.get_json(silent=True))
+    if why:
+        return err(why)
+    allc[owner] = new
+    try:
+        write_private(SOLAR_FILE, json.dumps(allc, indent=1))
+    except OSError as e:
+        return err(f"не вдалося записати налаштування: {e.strerror or e}", 500)
+    return jsonify(cfg=new)
+
+
+@app.get("/api/whoami")
+def api_whoami():
+    return jsonify(role=g.get("role", "admin"), auth=auth_on(), viewer=viewer_on(), viewer_user=VIEWER_USER if viewer_on() else None)
+
+
+@app.get("/api/audit")
+def api_audit():
+    """Журнал дій (лише адміністратор; глядачеві маршрут закритий переліком дозволеного)."""
+    with db_lock:
+        rows = db.execute("SELECT t, role, user, ip, action FROM audit ORDER BY id DESC LIMIT 200").fetchall()
+    return jsonify([{"t": r[0], "role": r[1], "user": r[2], "ip": r[3], "action": r[4]} for r in rows])
+
+
+@app.post("/api/viewer")
+def api_viewer():
+    """Пароль для ролі «лише перегляд»: {"password": "…"} задає, {"clear": true} вимикає роль."""
+    global _good_viewer
+    if not auth_on():
+        return err("Спершу задайте пароль адміністратора: без входу всі й так мають повний доступ", 400)
+    d = body()
+    if d.get("clear") is True:
+        Path(VIEWER_PWFILE).unlink(missing_ok=True)
+        _good_viewer = None
+        return jsonify(viewer=bool(VIEWER_PASSWORD))
+    pw = d.get("password")
+    if not isinstance(pw, str) or not 8 <= len(pw) <= 128:
+        return err("Пароль глядача: 8..128 символів")
+    try:
+        pw.encode()
+    except UnicodeEncodeError:
+        return err("Некоректний пароль")
+    if pw_ok(pw):
+        return err("Пароль глядача має відрізнятися від пароля адміністратора")
+    salt = os.urandom(16)
+    write_private(VIEWER_PWFILE, f"{salt.hex()}${_scrypt(pw, salt)}")
+    _good_viewer = None
+    return jsonify(viewer=True, viewer_user=VIEWER_USER)
+
+
+@app.get("/api/notify")
+def api_notify_get():
+    return jsonify(notify.public(notify_cfg))
+
+
+@app.post("/api/notify")
+def api_notify_set():
+    global notify_cfg
+    new, why = notify.update(notify_cfg, request.get_json(silent=True))
+    if why:
+        return err(why)
+    try:
+        notify.save(NOTIFY_FILE, new)
+    except OSError as e:
+        return err(f"не вдалося записати налаштування: {e.strerror or e}", 500)
+    notify_cfg = new
+    return jsonify(notify.public(new))
+
+
+@app.post("/api/notify/test")
+def api_notify_test():
+    """Надіслати пробне сповіщення в усі ввімкнені канали й показати, що вийшло (синхронно, до 8 с на канал)."""
+    res = notify.send(notify_cfg, "Meshpi", "Пробне сповіщення: усе працює.", "info", time.time())
+    if not res:
+        return err("жоден канал не ввімкнено")
+    return jsonify([{"channel": ch, "ok": ok, "why": why} for ch, ok, why in res])
 
 
 def age_text(sec):
@@ -1082,7 +1707,9 @@ def watcher():
     while True:
         time.sleep(EV_EVERY)
         for c in list(conns.values()):
+            _quiet(lambda c=c: alerts_tick(c))
             _quiet(lambda c=c: events_tick(c))
+            _quiet(lambda c=c: auto_tick(c))
 
 
 @app.get("/api/events")
@@ -1160,7 +1787,7 @@ def body():
 
 @app.get("/")
 def index():
-    return render_template("app.html")
+    return render_template("app.html", tile_url=TILE_URL, tile_attr=TILE_ATTR, tile_zoom=TILE_ZOOM)
 
 
 @app.get("/settings")
@@ -1232,11 +1859,11 @@ def mqtt_info(i):
 def status():
     i = cur_iface()
     if i is None:
-        return jsonify(connected=False, auth=auth_on(), conn=cur_id(), conns=[c.public() for c in conns.values()])
+        return jsonify(connected=False, auth=auth_on(), role=g.get("role", "admin"), conn=cur_id(), conns=conn_list())
     me = i.getMyNodeInfo() or {}
     lora = i.localNode.localConfig.lora
     return jsonify(
-        conn=cur_id(), conns=[c.public() for c in conns.values()],
+        role=g.get("role", "admin"), conn=cur_id(), conns=conn_list(),
         mqtt=mqtt_info(i),
         connected=True, node=plain(me.get("user", {})), metrics=plain(me.get("deviceMetrics", {})),
         hop_limit=lora.hop_limit, channel_num=lora.channel_num, node_count=sum(1 for n in all_nodes(i) if not n.get("viaMqtt")),
@@ -2190,7 +2817,7 @@ HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 
 @app.get("/api/conns")
 def get_conns():
-    return jsonify(current=cur_id(), conns=[c.public() for c in conns.values()])
+    return jsonify(current=cur_id(), conns=conn_list())
 
 
 @app.post("/api/conns")

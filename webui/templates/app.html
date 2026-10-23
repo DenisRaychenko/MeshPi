@@ -6,7 +6,7 @@
 <title>Meshpi</title>
 <link rel="icon" href="data:,">
 <meta name="theme-color" content="#0b1220">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
 <script>  // тема до відмальовування, щоб не було спалаху (як у style.css)
   try { document.documentElement.dataset.theme = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); }
   catch (e) { /* без сховища — темна */ }
@@ -191,6 +191,55 @@
       <tbody id="mlinks"></tbody>
     </table></div>
   </section>
+<section class="panel" id="rangebox">
+    <h2>Вимір дальності</h2>
+    <p class="evnote">Результати модуля Range Test: інший вузол надсилає «seq N» із заданим інтервалом, а ваш вузол записує, з яким SNR це дійшло й на якій відстані був відправник. Увімкніть Range Test на відправнику (у «Керуванні» його модулі) і йдіть чи їдьте від вузла. Модуль сам вимикається за 8 годин.</p>
+    <div class="row" style="margin-bottom:8px"><label>за <select class="tg-input" id="rangehours"><option value="6">6 год</option><option value="24" selected>24 год</option><option value="168">7 діб</option><option value="336">14 діб</option></select></label>
+      <a id="rangecsv" class="check-btn" href="/api/rangetest.csv" download>⬇ CSV</a><span id="rangenote" class="hint"></span></div>
+    <div id="rangechart"></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Відправник</th><th>Дійшло</th><th>Втрати</th><th>Найдальше</th><th>SNR</th><th>Серій</th></tr></thead>
+      <tbody id="rangerows"></tbody>
+    </table></div>
+</section>
+<section class="panel" id="planbox">
+    <h2>Планувальник лінка</h2>
+    <p class="evnote">Профіль рельєфу між двома вузлами, пряма видимість із кривизною Землі, перша зона Френеля й бюджет лінка у вільному просторі. <b>Кнопка надсилає координати двох вузлів на open-meteo.com</b> (висоти Copernicus DEM, крок 90 м). Дерева, будівлі й дифракція не враховані: це підказка для вибору місця, а не гарантія.</p>
+    <div class="row" style="margin-bottom:8px">
+      <label>A <select class="tg-input" id="plana"></select></label><label>B <select class="tg-input" id="planb"></select></label>
+      <label>антена A, м <input class="tg-input" id="planh1" type="number" value="3" min="0" max="200" style="width:4.5em"></label>
+      <label>антена B, м <input class="tg-input" id="planh2" type="number" value="3" min="0" max="200" style="width:4.5em"></label>
+      <label>МГц <input class="tg-input" id="planf" type="number" value="433.5" step="0.1" style="width:6em"></label>
+      <label>потужність, дБм <input class="tg-input" id="plantx" type="number" value="10" style="width:4.5em"></label>
+      <label>підсилення, дБі <input class="tg-input" id="plang" type="number" value="2" style="width:4.5em"></label>
+      <button type="button" id="plango" class="check-btn">📐 Розрахувати</button><span id="plannote" class="hint"></span>
+    </div>
+    <div id="planres"></div>
+</section>
+<section class="panel" id="solarbox">
+    <h2>Сонячний вузол: прогноз і запас акумулятора</h2>
+    <p class="evnote">Прогноз виробітку панелі від <b>forecast.solar</b> (безкоштовно 12 запитів на годину; координати панелі йдуть туди) і оцінка, чи вистачить акумулятора вузла на найближчі дні. Заряд береться з телеметрії вузла.</p>
+    <div class="row" style="margin-bottom:8px">
+      <label><input type="checkbox" id="solon"> ввімкнути</label>
+      <label>широта <input class="tg-input" id="sollat" type="number" step="0.0001" style="width:7em"></label><label>довгота <input class="tg-input" id="sollon" type="number" step="0.0001" style="width:7em"></label>
+      <button type="button" id="solpos" class="check-btn" title="Підставити позицію вузла">📍 з вузла</button>
+      <label>нахил панелі, ° <input class="tg-input" id="soldec" type="number" min="0" max="90" style="width:4.5em"></label>
+      <label>азимут, ° (0 південь, −90 схід, 90 захід) <input class="tg-input" id="solaz" type="number" min="-180" max="180" style="width:4.5em"></label>
+      <label>панель, кВт <input class="tg-input" id="solkwp" type="number" step="0.01" min="0.01" style="width:5em"></label>
+      <label>акумулятор, Вт·год <input class="tg-input" id="solcap" type="number" min="0" style="width:6em"></label>
+      <label>споживання вузла, Вт <input class="tg-input" id="solload" type="number" step="0.05" min="0.01" style="width:5em"></label>
+      <label>ККД, 0.3–1 <input class="tg-input" id="soleff" type="number" step="0.05" min="0.3" max="1" style="width:4.5em"></label>
+      <button type="button" id="solsave" class="check-btn">💾 Зберегти й оновити</button><span id="solnote" class="hint"></span>
+    </div>
+    <div id="solres"></div>
+</section>
+<section class="panel" id="healthbox">
+    <h2>Здоров'я мережі</h2>
+    <p class="evnote">За лічильниками, які вузол сам повідомляє раз на ~15 хв (LocalStats): скільки дублікатів, пакетів із помилками, відкинутих із черги. Пороги це евристики спільноти, а не правила прошивки: вони підказують, куди дивитися.</p>
+    <div class="row" style="margin-bottom:8px"><label>за <select class="tg-input" id="healthhours"><option value="6">6 год</option><option value="24" selected>24 год</option><option value="168">7 діб</option></select></label><span id="healthnote" class="hint"></span></div>
+    <div id="healthfind"></div>
+    <div class="chartgrid" id="healthcharts"></div>
+</section>
   </div>
   <div class="tabpane" data-tab="admin" role="tabpanel" hidden>
 <section class="panel" id="adminbox">
@@ -351,8 +400,13 @@
     <p class="hint" style="margin:0 0 10px">Останні пакети, які прийняв вибраний вузол: від кого, кому, тип, SNR/RSSI, стрибки й байт ретранслятора
       (останній байт id вузла, що передав пакет вам). Зашифровані пакети (чужі канали) без типу.</p>
     <div class="row" style="margin-bottom:8px">
-      <select class="tg-input" id="pktlim"><option value="50">50</option><option value="100" selected>100</option><option value="300">300</option></select>
+      <select class="tg-input" id="pktlim"><option value="50">50</option><option value="100" selected>100</option><option value="300">300</option><option value="1000">1000</option></select>
+      <select class="tg-input" id="pktport" title="Тип пакета"><option value="">усі типи</option></select>
+      <input class="tg-input" id="pktnode" placeholder="вузол: назва чи id" autocomplete="off" style="width:11em">
+      <label>SNR від <input class="tg-input" id="pktsnr" type="number" step="0.5" style="width:5em"></label>
+      <label><input type="checkbox" id="pktnomqtt"> без MQTT</label>
       <button type="button" id="pktgo" class="check-btn">⟳ Оновити</button>
+      <a id="pktcsv" class="check-btn" href="/api/packets.csv" download title="Завантажити відфільтровані пакети файлом CSV">⬇ CSV</a>
       <label><input type="checkbox" id="pktauto"> оновлювати кожні 3 с</label>
       <span id="pktnote" class="hint"></span>
     </div>
@@ -388,11 +442,42 @@
     </div>
     <p class="hint" style="margin-top:12px">У файлі: канали з ключами, назва вузла, історія повідомлень і графіків. Ключі каналів — секрет, зберігайте файл надійно. Відновлення замінює канали й історію; вузол перезапуститься.</p>
   </section>
+<section class="panel" id="accessbox">
+    <h2>Доступ і журнал дій</h2>
+    <p class="evnote">Другий вхід «лише перегляд» для тих, кому можна показати карту й чат, але не керування вузлом: він бачить усе, що лише читається, і не може нічого змінити, надіслати чи завантажити резервну копію. Пароль зберігається хешем на сервері.</p>
+    <p id="accstate" class="hint"></p>
+    <div class="row" style="margin-bottom:12px"><label>пароль глядача <input class="tg-input" id="accpw" type="password" autocomplete="new-password" placeholder="8–128 символів" style="width:14em"></label>
+      <button type="button" id="accsave" class="check-btn">💾 Задати</button><button type="button" id="accclear" class="check-btn" hidden>Вимкнути роль</button><span id="accmsg" class="hint"></span></div>
+    <h3 style="margin:14px 0 6px;font-size:.9rem">Журнал дій <button type="button" id="auditgo" class="check-btn">⟳</button></h3>
+    <div class="table-wrap" style="max-height:300px"><table>
+      <thead><tr><th>Коли</th><th>Роль</th><th>Хто</th><th>Звідки</th><th>Дія</th></tr></thead>
+      <tbody id="auditrows"></tbody>
+    </table></div>
+    <p class="hint">Пишуться зміни (не читання), входи та відмови глядачеві; тіла запитів і паролі не зберігаються. Адреса береться з'єднання: за зворотним проксі це адреса проксі.</p>
+</section>
+<section class="panel" id="autobox">
+    <h2>Автоматика: відповіді й оголошення</h2>
+    <p class="evnote"><b>Це передача в ефір без вашої участі.</b> Усе вимкнено, поки ви не ввімкнете; жорсткі обмеження (пауза на вузол, ліміт передач на годину, не передавати при зайнятому ефірі) діють завжди. Ви відповідаєте за те, що передає ваш вузол: дотримуйтесь свого ліміту ефіру (duty cycle) і місцевих правил. Автоматичні повідомлення починаються з «[авто]», на такі панель сама не відповідає.</p>
+    <div id="autoform"></div>
+    <div class="row" style="margin-top:10px"><button type="button" id="autosave" class="check-btn">💾 Зберегти</button><span id="automsg" class="hint"></span></div>
+</section>
+<section class="panel" id="secbox">
+    <h2>Перевірка безпеки</h2>
+    <p class="evnote">Лише читання: повтори публічних ключів серед вузлів, ключ каналу за замовчуванням, вихід у MQTT, адміністрування через канал. Секретні ключі панель не читає й не показує.</p>
+    <div class="row" style="margin-bottom:8px"><button type="button" id="secrun" class="check-btn">🔍 Перевірити</button><span id="secnote" class="hint"></span></div>
+    <div id="secfind"></div>
+</section>
+<section class="panel" id="notifybox">
+    <h2>Сповіщення поза браузером</h2>
+    <p class="evnote">Куди надсилати події (нові вузли, обрані, що пропали, низький заряд, перевантажений ефір, перезапуск вузла, втрата зв'язку), коли вкладка закрита. Токени лежать лише на сервері й браузеру не віддаються: порожнє поле лишає збережений токен.</p>
+    <div id="notifyform"></div>
+    <div class="row" style="margin-top:10px"><button type="button" id="notifysave" class="check-btn">💾 Зберегти</button><button type="button" id="notifytest" class="check-btn">📨 Надіслати пробне</button><span id="notifymsg" class="hint"></span></div>
+</section>
   </div>
 </main>
 <footer class="hint foot">Meshpi © 2026 JunioR · ліцензія MIT</footer>
 </div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
 <script src="/static/logic.js"></script>
 <script src="/static/common.js"></script>
 <script src="/static/tabs.js"></script>
@@ -570,7 +655,7 @@ function renderMap() {
   const first = !map;
   if (first) {
     map = L.map('map');
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 19, attribution: '© OpenStreetMap'}).addTo(map);
+    L.tileLayer({{ tile_url|tojson }}, {maxZoom: {{ tile_zoom }}, attribution: {{ tile_attr|tojson }}}).addTo(map);  // MESHPI_TILE_URL: власний сервер плиток для роботи без інтернету
     markers = L.layerGroup().addTo(map);
     window.meshMap = map;  // для точок на карті (waypoints.js)
     window.dispatchEvent(new Event('meshmap'));
@@ -1139,6 +1224,14 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/quick.js"></script>
 <script src="/static/waypoints.js"></script>
 <script src="/static/events.js"></script>
+<script src="/static/health.js"></script>
+<script src="/static/rangetest.js"></script>
+<script src="/static/plan.js"></script>
+<script src="/static/notify.js"></script>
+<script src="/static/security.js"></script>
+<script src="/static/auto.js"></script>
+<script src="/static/access.js"></script>
+<script src="/static/role.js"></script>
 <script src="/static/nodecharts.js"></script>
 </body>
 </html>

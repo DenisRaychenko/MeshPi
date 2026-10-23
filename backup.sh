@@ -34,7 +34,7 @@ PY
 fi
 
 tar --ignore-failed-read -czf "$DEST/files-$stamp.tgz" .env docker-compose.yml \
-  data/password data/location.json data/secret.key data/noauth data/pong data/nodes.json data/notrace 2>/dev/null || true
+  data/password data/location.json data/secret.key data/noauth data/pong data/nodes.json data/notrace data/notify.json data/viewerpw 2>/dev/null || true
 
 sync
 find "$DEST" -type f \( -name 'messages-*.db' -o -name 'files-*.tgz' \) -mtime +"$KEEP_DAYS" -delete

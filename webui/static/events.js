@@ -6,8 +6,8 @@
   const tab = document.querySelector('#tabbar [data-tab="events"]');
   if (!rows || !tab) return;
   const $id = id => document.getElementById(id);
-  const LABEL = {new: 'Новий', fav_off: 'Пропав', fav_on: 'Повернувся'};  // підпис-таблетка: колір і слово, а не емодзі
-  const TITLE = {new: 'Новий вузол', fav_off: 'Обраний пропав', fav_on: 'Обраний повернувся'};
+  const LABEL = {new: 'Новий', fav_off: 'Пропав', fav_on: 'Повернувся', bat_low: 'Заряд', chan_high: 'Ефір', reboot: 'Перезапуск', link_lost: "Зв'язок втрачено", link_ok: "Зв'язок є"};  // підпис-таблетка: колір і слово, а не емодзі
+  const TITLE = {new: 'Новий вузол', fav_off: 'Обраний пропав', fav_on: 'Обраний повернувся', bat_low: 'Низький заряд', chan_high: 'Ефір перевантажений', reboot: 'Вузол перезапустився', link_lost: "Зв'язок втрачено", link_ok: "Зв'язок відновлено"};
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* без сховища — ок */ } },
