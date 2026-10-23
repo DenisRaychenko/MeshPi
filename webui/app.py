@@ -943,7 +943,17 @@ def api_netstats():
         series.setdefault(k, []).append([t, v])
     if own and "chan" not in series:  # власні виміри панелі щільніші за телеметрію
         series["chan"] = [[t, c] for t, c in own]
-    rep = extras.health_report(series, now)
+    ctx = None
+    if i is not None:  # скільки в нас прямих сусідів (чути за останню годину, 0 стрибків, не MQTT) і який hop_limit
+        direct = sum(1 for n in all_nodes(i) if n.get("hopsAway") == 0 and not n.get("viaMqtt") and now - (n.get("lastHeard") or 0) < 3600
+                     and (n.get("user") or {}).get("id") != me)
+        try:
+            hop_limit = i.localNode.localConfig.lora.hop_limit or None
+        except AttributeError:
+            hop_limit = None
+        ctx = {"direct": direct, "hop_limit": hop_limit}
+    rep = extras.health_report(series, now, ctx)
+    rep["context"] = ctx
     rep["hours"] = hours
     for k in ("dup", "bad", "chan", "noise"):
         rep["series"][k] = thin(rep["series"][k], 120)

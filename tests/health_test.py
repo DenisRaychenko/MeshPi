@@ -55,6 +55,21 @@ s["ls_noise"] = [(T0, -115.0), (T0 + 900, -92.0)]
 check("high noise floor is a warning", any(f["id"] == "noise" for f in x.health_report(s, T0)["findings"]))
 check("per-interval series are built", len(x.health_report(series(100, dup=10, bad=5), T0)["series"]["dup"]) == 3)
 
+# ---- контекст: прямі сусіди й hop_limit ----
+s66 = series(100, dup=66, bad=0)           # rx 100, dup 66: кожен унікальний пакет приходить ~2.9 раза
+dup_of = lambda r: next(f for f in r["findings"] if f["id"] == "dup")
+r = x.health_report(s66, T0, {"direct": 3, "hop_limit": 7})
+check("66% duplicates with 3 direct neighbours is normal flooding: informational, not a problem", dup_of(r)["level"] == "info" and r["status"] != "crit" and "3 прямих сусідів" in dup_of(r)["text"], dup_of(r)["text"][:80])
+check("... the text gives the copies per unique packet", "2.9 раза" in dup_of(r)["text"], dup_of(r)["text"][:90])
+r = x.health_report(s66, T0, {"direct": 1})
+check("the same duplicates with a single direct neighbour are a warning (copies come over several paths)", dup_of(r)["level"] == "warn" and r["status"] == "warn")
+r = x.health_report(s66, T0, {"direct": 3, "hop_limit": 7})
+check("a hop_limit above 3 is mentioned, without telling to change it", any(f["id"] == "hoplimit" and "не чіпає" in f["text"] for f in r["findings"]))
+check("hop_limit 3 is not mentioned", not any(f["id"] == "hoplimit" for f in x.health_report(s66, T0, {"direct": 3, "hop_limit": 3})["findings"]))
+check("low duplicates: no duplicate finding even with a context", not any(f["id"] == "dup" for f in x.health_report(series(100, dup=5), T0, {"direct": 3, "hop_limit": 7})["findings"]))
+check("without a context the old heuristic stays", dup_of(x.health_report(s66, T0))["level"] == "crit")
+check("0 direct neighbours (unknown hops) falls back to the plain heuristic instead of talking nonsense", dup_of(x.health_report(series(100, dup=40), T0, {"direct": 0}))["level"] in ("warn", "crit"))
+
 # ---- запис пакета й API ----
 ME = 0x100
 ID = lambda n: f"!{n:08x}"
@@ -94,6 +109,7 @@ check("LocalStats are stored under ls_* keys", {"ls_rx", "ls_dup", "ls_bad", "ls
 j = c.get("/api/netstats").get_json()
 check("API: 25% duplicates over 4 samples is a warning", j["status"] == "warn" and abs(j["ratios"]["dup"] - 0.25) < 1e-9 and j["samples"] == 4, str(j["findings"]))
 check("API: totals, hours and series present", j["totals"]["rx"] == 300 and j["hours"] == 24 and len(j["series"]["dup"]) == 3)
+check("API: the context (direct neighbours, hop_limit) comes with the report", j["context"] is not None and j["context"]["direct"] == 0, str(j["context"]))
 check("API: bad hours are refused", c.get("/api/netstats?hours=x").status_code == 400)
 check("API: 6 hours window works", c.get("/api/netstats?hours=6").get_json()["hours"] == 6)
 # чужі вузли й сміття не потрапляють у запис

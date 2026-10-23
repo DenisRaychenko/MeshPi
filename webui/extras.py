@@ -35,8 +35,10 @@ def deltas(points):
     return out
 
 
-def health_report(series, now=None):
-    """series: {ключ tele: [(t, v), ...]} за вікно. Підсумок за вікно, ряди співвідношень по інтервалах і висновки."""
+def health_report(series, now=None, ctx=None):
+    """series: {ключ tele: [(t, v), ...]} за вікно. Підсумок за вікно, ряди співвідношень по інтервалах і висновки.
+    ctx (за наявності): {direct: прямих сусідів за останню годину, hop_limit}. Дублікати це звичайна ціна затоплення: кожен прямий
+    сусід ретранслює пакет, тож «копій на пакет» близько до числа сусідів нормальне. Без контексту лишається проста евристика."""
     now = now or time.time()
     d = {k: deltas(series.get(k) or []) for k in COUNTERS}
     tot = {k: sum(v for _t, v in d[k]) for k in COUNTERS}
@@ -65,10 +67,28 @@ def health_report(series, now=None):
         if tot["ls_rx"] < MIN_RX:
             found.append({"level": "info", "id": "few", "text": f"За вікно прийнято лише {int(tot['ls_rx'])} пакетів: "
                                                                   "для висновків замало."})
-        if dup is not None and dup > DUP_WARN:
+        uniq = tot["ls_rx"] - tot["ls_dup"] - tot["ls_bad"]
+        copies = tot["ls_rx"] / uniq if uniq > 0 else None
+        direct = (ctx or {}).get("direct") or None   # 0 прямих сусідів при прийнятих пакетах означає, що hopsAway невідомі: контексту немає
+        if dup is not None and dup > DUP_WARN and direct is not None and copies is not None:
+            if copies <= max(direct, 1) + 0.75:
+                found.append({"level": "info", "id": "dup",
+                              "text": f"Дублікатів {dup:.0%}: кожен унікальний пакет доходить до вас у середньому {copies:.1f} раза. У вас {direct} прямих сусідів, "
+                                      "і кожен ретранслює пакети, тож це звичайне затоплення мережі, а не несправність. Дублікатів меншає лише тоді, коли сусіди, "
+                                      "яким ретранслювати не потрібно, мають роль CLIENT_MUTE (це їхні налаштування, не ваші)."})
+            else:
+                found.append({"level": "warn", "id": "dup",
+                              "text": f"Дублікатів {dup:.0%}: пакет доходить у середньому {copies:.1f} раза, а прямих сусідів лише {direct}. Копії, схоже, йдуть "
+                                      "кількома шляхами через ретранслятори (ROUTER, REPEATER) за межами прямої видимості; перевірте їхні ролі."})
+        elif dup is not None and dup > DUP_WARN:
             found.append({"level": "crit" if dup > DUP_CRIT else "warn", "id": "dup",
                           "text": f"Дублікатів {dup:.0%} прийнятого. Схоже, пакети ретранслюють зайві вузли (ROUTER, REPEATER "
                                   "або багато сусідів); перевірте ролі вузлів поруч."})
+        hl = (ctx or {}).get("hop_limit")
+        if isinstance(hl, int) and hl > 3 and dup is not None and dup > DUP_WARN:
+            found.append({"level": "info", "id": "hoplimit",
+                          "text": f"На вашому вузлі hop_limit = {hl} (типово 3, документація Meshtastic каже, що 3 достатньо для більшості мереж). "
+                                  "Більший ліміт відправляє ваші пакети далі й додає трафіку та дублікатів. Змінювати чи ні, вирішуєте ви: панель налаштувань вузла не чіпає."})
         if bad is not None and bad > BAD_WARN and (chan or 0) > CHAN_WARN:
             found.append({"level": "warn", "id": "bad",
                           "text": f"{bad:.0%} прийнятого з помилками, а канал зайнятий на {chan:.0f}%: схоже на завади "
