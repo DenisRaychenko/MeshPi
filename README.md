@@ -51,6 +51,7 @@ Telegram-мосту: проксі роздає потік вузла кільк�
 | `webui/admin.py` | керування вузлами: розділи конфігурації, канали, позиція, дії; свій вузол і віддалені по радіо |
 | `webui/templates/app.html` | єдина сторінка з вкладками; `login.html`: сторінка входу |
 | `webui/static/` | `tabs.js` (вкладки), `env.js` (довкілля), `mesh.js` (карта мережі), `logic.js`, `common.js`, `style.css` |
+| `pi-agent/` | Агент для Pi (лише читання): віддає панелі потужність і стелю чипа з журналу й конфігів `meshtasticd` |
 | `telegram-bot/` | Telegram-міст для Meshtastic (працює на Pi як служба `mesh-telegram`): код, інсталятор, опис |
 | `docs/` | `INSTALL.md`: встановлення; `WEB-PANEL.md`: опис можливостей з картинками (`docs/img/`) |
 | `Dockerfile`, `docker-compose.yml` | образ без root, файлова система лише для читання, ліміт 256 МБ |
@@ -80,6 +81,7 @@ python tests/mesh_test.py webui     # зв'язки з пакетів, добо�
 python tests/multi_test.py webui    # кілька вузлів, міграція старої бази, дані окремо для кожного вузла
 python tests/admin_test.py webui    # адміністрування свого й віддаленого вузла (підставний вузол)
 python tests/features_test.py webui # статус доставки, позиція, готові повідомлення, QR, журнал пакетів
+python tests/agent_test.py webui    # агент на Pi (токен, кеш, пошук стелі) і його підключення до панелі
 python tests/waypoint_test.py webui # точки на карті (прийом, блокування, надсилання), телеметрія вузлів і /api/telemetry
 ```
 

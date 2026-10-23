@@ -17,6 +17,8 @@ import threading
 import time
 from pathlib import Path
 
+import urllib.error
+import urllib.request
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -106,21 +108,33 @@ log = logging.getLogger("meshpi")
 # у браузері показується вибраний (cookie-сесія). Кожен рядок в базі має власника — id підключення.
 NODES_FILE = os.environ.get("MESHPI_NODES_FILE", str(Path(DB_PATH).with_name("nodes.json")))
 CONN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
+# адреса агента на Pi: лише http(s)://хост[:порт] — без логіна в адресі, шляху й параметрів
+AGENT_URL_RE = re.compile(r"^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$")
+AGENT_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{16,200}$")
+
+
+def agent_url_ok(s):
+    m = AGENT_URL_RE.match(s)
+    port = s.rsplit(":", 1)[-1] if m and s.count(":") > 1 else None
+    return bool(m) and (port is None or int(port) <= 65535)
 
 
 class Conn:
     """Одне підключення до вузла: адреса (TCP API meshtasticd чи проксі), інтерфейс бібліотеки й стан."""
 
-    def __init__(self, cid, name, host, port):
+    def __init__(self, cid, name, host, port, agent="", agent_token=""):
         self.id, self.name, self.host, self.port = cid, name, host, int(port)
+        self.agent, self.agent_token = agent, agent_token  # агент на Pi (pi-agent/): потужність з журналу meshtasticd
+        self.agent_cache: tuple = (0.0, None)
         self.iface = None
         self.error = None
         self.dead = False  # підключення видалено — потік підключення завершується
         self.admin_lock = threading.Lock()  # адмін-запити по радіо йдуть по одному (спільний стан підтверджень)
 
-    def public(self):
+    def public(self):  # токен агента браузеру не віддаємо ніколи
         return {"id": self.id, "name": self.name, "host": self.host, "port": self.port,
-                "online": self.iface is not None, "error": self.error}
+                "online": self.iface is not None, "error": self.error,
+                "agent": self.agent, "agent_token_set": bool(self.agent_token)}
 
 
 conns: dict[str, Conn] = {}
@@ -279,25 +293,31 @@ def load_conns():
         if not isinstance(items, list):
             raise ValueError
     except (OSError, ValueError):
-        items = [{"id": "main", "name": "Основний вузол", "host": MESH_HOST, "port": MESH_PORT}]
+        items = [{"id": "main", "name": "Основний вузол", "host": MESH_HOST, "port": MESH_PORT,
+                  "agent": os.environ.get("MESHPI_AGENT_URL", ""), "agent_token": os.environ.get("MESHPI_AGENT_TOKEN", "")}]
     with conns_lock:
         keep: dict[str, Conn] = {}
         for it in items:
             try:
                 cid, host, port = str(it["id"]), str(it["host"]).strip(), int(it["port"])
                 name = str(it.get("name") or cid)[:40]
+                agent, token = str(it.get("agent") or ""), str(it.get("agent_token") or "")
                 if not CONN_ID_RE.match(cid) or cid in keep or not host or not 1 <= port <= 65535:
                     continue
+                if agent and not agent_url_ok(agent):
+                    agent = token = ""
             except (KeyError, TypeError, ValueError, AttributeError):
                 continue
             old = conns.get(cid)
             if old and (old.host, old.port) == (host, port):
                 old.name = name
+                if (old.agent, old.agent_token) != (agent, token):
+                    old.agent, old.agent_token, old.agent_cache = agent, token, (0.0, None)
                 keep[cid] = old
                 continue
             if old:
                 drop_conn(old)
-            keep[cid] = Conn(cid, name, host, port)
+            keep[cid] = Conn(cid, name, host, port, agent, token)
             if run_threads:
                 threading.Thread(target=conn_loop, args=(keep[cid],), daemon=True).start()
         if not keep:
@@ -1216,15 +1236,56 @@ def health():
 def chip_cap():
     """SX126X_MAX_POWER або RF95_MAX_POWER із конфігів meshtasticd (22, якщо ключа немає)
     і назва конфігу модуля, де він заданий (lora-e22-400m33s.yaml тощо) — щоб знати підсилювач."""
-    cap, radio = 22, None
-    for f in sorted(Path("/").glob(CFG_GLOB.lstrip("/"))):
+    cap, radio, seen = 22, None, False
+    files = [Path("/etc/meshtasticd/config.yaml"), *sorted(Path("/").glob(CFG_GLOB.lstrip("/")))]  # головний конфіг і config.d
+    for f in files:
         try:
             found = CAP_RE.findall(f.read_text())
         except OSError:
             continue
+        seen = True
         if found:
             cap, radio = int(found[-1]), f.name
-    return cap, radio
+    return (cap if seen else None), radio  # немає жодного конфігу (панель не на Pi) — стелю не вигадуємо
+
+
+class AgentError(Exception):
+    """Агент на Pi недоступний або відповів не так: текст готовий для показу."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):  # агент не має перенаправляти: не даємо вести запит з токеном деінде
+        return None
+
+
+AGENT_TTL = 15  # с: стільки тримаємо відповідь агента (він сам кешує журнал ще 10 с)
+
+
+def _num_or_none(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and -100 <= v <= 100 else None
+
+
+def agent_info(c):
+    """Потужність і стеля чипа від агента на Pi (pi-agent/): {logged, final, cap, radio}. Кеш на AGENT_TTL с."""
+    ts, val = c.agent_cache
+    if val is not None and time.time() - ts < AGENT_TTL:
+        return val
+    req = urllib.request.Request(c.agent + "/radio.json", headers={"Authorization": "Bearer " + c.agent_token})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=4) as r:
+            raw = json.loads(r.read(4096))
+    except urllib.error.HTTPError as e:
+        raise AgentError({401: "токен не підходить", 403: "IP сервера панелі не дозволено на агенті",
+                          404: "це не агент (шлях /radio.json не знайдено)"}.get(e.code, f"відповідь HTTP {e.code}")) from e
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise AgentError("немає зв'язку з агентом: " + str(getattr(e, "reason", e))[:80]) from e
+    if not isinstance(raw, dict):
+        raise AgentError("агент відповів не так, як очікувалось")
+    radio = raw.get("radio")
+    val = {"logged": _num_or_none(raw.get("logged")), "final": _num_or_none(raw.get("final")), "cap": _num_or_none(raw.get("cap")),
+           "radio": radio if isinstance(radio, str) and re.fullmatch(r"[\w.-]{1,80}", radio) else None}
+    c.agent_cache = (time.time(), val)
+    return val
 
 
 def build_running():
@@ -1250,20 +1311,35 @@ def package_state():
 
 @app.get("/api/power")
 def power():
-    # лише потрібні рядки з журналу за все завантаження: «останні 500» при активному ефірі їх уже не містять
-    text = sh("journalctl", "-u", "meshtasticd", "-b", "--no-pager", "-o", "cat",
-              "-g", "Set radio|Final Tx power", "-n", "10", "-r")
-    # -n з -g journalctl і так видає новіші першими; -r явно — щоб порядок не залежав від версії systemd
-    logged = [int(x) for x in POWER_RE.findall(text)]
-    final = [int(x) for x in FINAL_RE.findall(text)]
-    cap, radio = chip_cap()
+    """Потужність радіо. Журнал і конфіги meshtasticd є лише на самій Pi: або читаємо їх тут (панель на Pi), або
+    беремо в агента на Pi (pi-agent/), адресу й токен якого задано в налаштуваннях вузла."""
+    c, i = cur(), cur_iface()
     exe = shutil.which("meshtasticd")
-    i = cur_iface()
+    source, agent_error, logged, final, cap, radio = None, None, None, None, None, None
+    if c.agent:
+        try:
+            a = agent_info(c)
+            logged, final, cap, radio, source = a["logged"], a["final"], a["cap"], a["radio"], "agent"
+        except AgentError as e:
+            agent_error = str(e)
+    else:
+        # лише потрібні рядки з журналу за все завантаження: «останні 500» при активному ефірі їх уже не містять
+        text = sh("journalctl", "-u", "meshtasticd", "-b", "--no-pager", "-o", "cat",
+                  "-g", "Set radio|Final Tx power", "-n", "10", "-r")
+        # -n з -g journalctl і так видає новіші першими; -r явно — щоб порядок не залежав від версії systemd
+        lg, fn = [int(x) for x in POWER_RE.findall(text)], [int(x) for x in FINAL_RE.findall(text)]
+        logged, final = (lg[0] if lg else None), (fn[0] if fn else None)
+        cap, radio = chip_cap()
+        source = "local" if (exe or logged is not None or cap is not None) else None
+    if final is not None:
+        effective = final
+    else:
+        effective = min(logged, cap) if logged is not None and cap is not None else None
+    native = bool(exe)  # meshtasticd встановлено тут: «змінена прошивка» і пакети мають сенс лише тоді
     return jsonify(
         setting=i.localNode.localConfig.lora.tx_power if i else None,
-        logged=logged[0] if logged else None, cap=cap, radio=radio,
-        effective=final[0] if final else min(logged[0], cap) if logged else None,
-        patched=bool(exe and Path(exe + ".stock").exists()),
+        logged=logged, cap=cap, radio=radio, effective=effective, source=source, agent_error=agent_error, agent=bool(c.agent),
+        patched=bool(exe and Path(exe + ".stock").exists()) if native else None,
         running=build_running(), **package_state(),
         log=sh("journalctl", "-u", "meshpi-power@*", "-b", "-n", "60", "--no-pager", "-o", "cat"))
 
@@ -2029,7 +2105,8 @@ def edit_conns():
         return jsonify(current=cid)
     if action not in ("add", "update", "remove"):
         return err("action: add | update | remove | select")
-    items = {c.id: {"id": c.id, "name": c.name, "host": c.host, "port": c.port} for c in conns.values()}
+    items = {c.id: {"id": c.id, "name": c.name, "host": c.host, "port": c.port, "agent": c.agent, "agent_token": c.agent_token}
+             for c in conns.values()}
     if action == "remove":
         cid = d.get("id")
         if cid not in items:
@@ -2047,6 +2124,15 @@ def edit_conns():
         if type(port) is not int or not 1 <= port <= 65535:
             return err("Порт: число 1..65535")
         name, host = name.strip(), host.strip()
+        agent, token = d.get("agent"), d.get("agent_token")  # None — не змінювати (для нового — порожньо)
+        if agent is not None:
+            agent = agent.strip().rstrip("/") if isinstance(agent, str) else None
+            if agent is None or (agent and not agent_url_ok(agent)):
+                return err("Адреса агента: http://хост:порт (без логіна, шляху й параметрів)")
+        if token is not None:
+            token = token.strip() if isinstance(token, str) else None
+            if token is None or (token and not AGENT_TOKEN_RE.match(token)):
+                return err("Токен агента: 16–200 символів (літери, цифри та . _ ~ + / = -)")
         if action == "add":
             base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:20] or "node"
             cid, n = base, 2
@@ -2054,12 +2140,20 @@ def edit_conns():
                 cid, n = f"{base}-{n}", n + 1
             if len(items) >= 8:
                 return err("Не більше 8 вузлів")
-            items[cid] = {"id": cid, "name": name, "host": host, "port": port}
+            items[cid] = {"id": cid, "name": name, "host": host, "port": port, "agent": agent or "", "agent_token": token or ""}
         else:
             cid = d.get("id")
             if cid not in items:
                 return err("Невідоме підключення", 404)
             items[cid].update(name=name, host=host, port=port)
+            if agent is not None:
+                items[cid]["agent"] = agent
+                if not agent:
+                    items[cid]["agent_token"] = ""  # без агента токен не потрібен
+            if token is not None:
+                items[cid]["agent_token"] = token
+        if items[cid]["agent"] and not items[cid]["agent_token"]:
+            return err("Для агента потрібен токен (його показує інсталятор на Pi)")
     try:
         write_private(NODES_FILE, json.dumps(list(items.values()), ensure_ascii=False, indent=1))
     except OSError:

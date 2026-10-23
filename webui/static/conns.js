@@ -3,7 +3,8 @@
 (function () {
   const sel = $('#nodesel'), rows = $('#connrows'), msg = $('#connmsg'), form = $('#connform');
   if (!sel || !rows) return;
-  const f = {name: $('#cname'), host: $('#chost'), port: $('#cport'), go: $('#cgo'), cancel: $('#ccancel')};
+  const f = {name: $('#cname'), host: $('#chost'), port: $('#cport'), agent: $('#cagent'), token: $('#ctoken'),
+             go: $('#cgo'), cancel: $('#ccancel')};
   let data = null, editing = null;
 
   const say = (t, bad) => { msg.textContent = t || ''; msg.style.color = bad ? 'var(--crit)' : ''; };
@@ -19,7 +20,9 @@
     for (const c of data.conns) {
       const tr = rows.insertRow();
       tr.insertCell().textContent = c.name + (c.id === data.current ? '  (вибраний)' : '');
-      tr.insertCell().textContent = `${c.host}:${c.port}`;
+      const addr = tr.insertCell();
+      addr.textContent = `${c.host}:${c.port}`;
+      if (c.agent) { const s = document.createElement('div'); s.className = 'hint'; s.textContent = `агент: ${c.agent}`; addr.append(s); }
       const st = tr.insertCell();
       st.textContent = c.online ? 'на зв\'язку' : 'немає зв\'язку' + (c.error ? ` — ${c.error}` : '');
       st.style.color = c.online ? 'var(--signal)' : 'var(--crit)';
@@ -43,11 +46,12 @@
   }
   function edit(c) {
     editing = c.id;
-    f.name.value = c.name; f.host.value = c.host; f.port.value = c.port;
+    f.name.value = c.name; f.host.value = c.host; f.port.value = c.port; f.agent.value = c.agent || ''; f.token.value = '';
+    f.token.placeholder = c.agent_token_set ? 'токен збережено: залиште порожнім, щоб не змінювати' : 'Токен агента (з інсталятора)';
     f.go.textContent = '✓ Зберегти'; f.cancel.hidden = false; f.name.focus();
   }
   function reset() {
-    editing = null; form.reset(); f.port.value = 4403;
+    editing = null; form.reset(); f.port.value = 4403; f.token.placeholder = 'Токен агента (з інсталятора)';
     f.go.textContent = '＋ Додати вузол'; f.cancel.hidden = true;
   }
   async function remove(c) {
@@ -62,6 +66,8 @@
     ev.preventDefault();
     const body = {action: editing ? 'update' : 'add', name: f.name.value, host: f.host.value, port: +f.port.value};
     if (editing) body.id = editing;
+    body.agent = f.agent.value.trim();  // порожня адреса вимикає агента й стирає токен
+    if (f.token.value.trim()) body.agent_token = f.token.value.trim();  // порожній токен — лишаємо збережений
     try {
       data = await api('/api/conns', body);
       say(editing ? 'Збережено.' : 'Вузол додано: панель підключається, за кілька секунд він з\'явиться «на зв\'язку».');

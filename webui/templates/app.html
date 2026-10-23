@@ -323,6 +323,9 @@
       <input class="tg-input" id="cname" placeholder="Назва (напр. «Дача»)" maxlength="40" required autocomplete="off">
       <input class="tg-input" id="chost" placeholder="Адреса: 192.168.1.50" maxlength="253" required autocomplete="off">
       <input class="tg-input" id="cport" type="number" min="1" max="65535" value="4403" style="width:90px" required>
+      <input class="tg-input" id="cagent" placeholder="Агент на Pi: http://192.168.1.50:8097 (необов'язково)" maxlength="260" autocomplete="off" style="min-width:280px"
+             title="Показує на «Радіо» фактичну потужність на виході чипа, коли панель не на самій Pi. Встановлюється з pi-agent/">
+      <input class="tg-input" id="ctoken" type="password" placeholder="Токен агента (з інсталятора)" maxlength="200" autocomplete="new-password">
       <button class="check-btn" id="cgo">＋ Додати вузол</button>
       <button type="button" class="reboot-btn" id="ccancel" hidden>Скасувати</button>
     </form>
@@ -883,14 +886,19 @@ async function refreshPower() {
     const f = v => v == null ? ['—'] : [v, 'дБм'];
     metrics($('#pwr'), [['Задано', ...f(p.setting)], ['Після ліміту регіону', ...f(p.logged)],
         ['Стеля чипа (конфіг)', ...f(p.cap)], ['Фактично на виході чипа', ...f(p.effective)],
-        ['Прошивка', p.patched ? 'змінена' : 'стандартна']]);
+        ['Прошивка', p.patched == null ? '—' : p.patched ? 'змінена' : 'стандартна']]);
     fillPowerTable(p.radio);
     $('#cap').max = /ra-01|rfm98pw/i.test(p.radio || '') ? 20 : 22;  // SX1278 — до 20 дБм (raise-power.sh інакше відмовить)
     if (+$('#cap').value > +$('#cap').max) $('#cap').value = $('#cap').max;
     const t = antTable(p.radio);
-    $('#pwrnote').textContent = p.logged == null
+    $('#pwrnote').textContent = p.agent_error
+      ? `Агент на Pi: ${p.agent_error}. Перевірте адресу й токен у «Система → Вузли панелі».`
+      : p.source == null && p.logged == null && p.cap == null
+        ? 'Журнал і конфіги meshtasticd є лише на самій Pi. Щоб тут були «Після ліміту регіону», «Стеля чипа» й «Фактично на виході чипа», ' +
+          'встановіть агента на Pi (папка pi-agent) і вкажіть його адресу та токен у «Система → Вузли панелі» (✎ біля вузла).'
+      : p.logged == null
       ? 'У журналі meshtasticd ще немає рядка «Set radio» (він з’являється при старті радіо).'
-      : t ? `Модуль ${t.name} на антені видає більше, ніж на виході чипа (підсилювач модуля) — див. таблицю в блоці «Радіо».` : '';
+      : t ?`Модуль ${t.name} на антені видає більше, ніж на виході чипа (підсилювач модуля) — див. таблицю в блоці «Радіо».` : '';
     // raise-power.sh утримує пакет (apt-mark hold): оновлення прошивки, зокрема безпеки, самі не приходять
     $('#pkgnote').hidden = !p.held;
     $('#pkgnote').textContent = `Оновлення meshtasticd заблоковано (змінена прошивка): встановлено ${p.installed || '?'}, ` +
