@@ -112,4 +112,14 @@ for rule in m.app.url_map.iter_rules():
         seen[key] = rule.endpoint
 check("no route is registered twice", not dups, str(dups))
 check("the old /api/health of the overview page still answers", "connected" in c.get("/api/health").get_json())
+m._health = (0.0, {})
+check("health: no SPI and no systemctl (Docker on another host) means the radio is not local", c.get("/api/health").get_json()["local"] is False
+      or m.shutil.which("systemctl") is not None)
+m._health = (0.0, {})
+real = m.shutil.which
+m.shutil.which = lambda name, *a, **k: "/usr/bin/systemctl"
+check("health: with systemctl present the radio counts as local", c.get("/api/health").get_json()["local"] is True)
+m.shutil.which = real
+page = c.get("/").get_data(as_text=True)
+check("the page shows the SPI and service pills neutrally when the radio is elsewhere", "h.local === false" in page and "радіо на іншій платі" in page)
 sys.exit(0 if ok else 1)

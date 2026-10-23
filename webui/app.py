@@ -584,6 +584,9 @@ def logout():
     return redirect("/login")
 
 
+ADMIN_READ_OPS = {"read", "channels", "owner", "metadata", "canned", "share_url", "request_position"}  # не змінюють вузол: не пишемо в журнал
+
+
 @app.after_request
 def audit_actions(resp):
     """Кожна дія, що щось міняє (не GET), і кожна відмова глядачеві потрапляє в журнал дій."""
@@ -594,7 +597,13 @@ def audit_actions(resp):
         if viewer and resp.status_code != 403:
             return resp  # дозволене глядачеві (вибір вузла, вихід) у журнал не пишемо
         if request.method not in ("GET", "HEAD", "OPTIONS"):  # закриті GET глядача (їх опитує сторінка) не пишемо: це шум
-            audit(f"{request.method} {request.path} → {resp.status_code}", g.get("user", ""))
+            what = f"{request.method} {request.path}"
+            if request.path == "/api/admin/job":  # адмін-завдання йдуть через POST і для читання: у журнал лише записи, без значень
+                d = request.get_json(silent=True) or {}
+                if d.get("op") in ADMIN_READ_OPS:
+                    return resp
+                what += f" {d.get('op')} {d.get('section') or d.get('name') or ''} → {d.get('target', 'local')}".replace("  ", " ")
+            audit(f"{what} → {resp.status_code}", g.get("user", ""))
     except Exception:  # noqa: BLE001
         pass
     return resp
@@ -1953,7 +1962,10 @@ def health():
             "spi": Path("/dev/spidev0.0").exists(),
             "service": sh("systemctl", "is-active", "meshtasticd").strip(),
             "errors": [x for x in lines if RADIO_ERR.search(x) and not HARMLESS.search(x)][-5:]})
-    return jsonify({**_health[1], "connected": cur_iface() is not None})
+    # local: радіо підключене до цієї ж плати (є SPI чи systemd). У Docker на іншому хості радіо лише по мережі, тож «немає
+    # /dev/spidev0.0» і «systemctl недоступний» там норма, а не несправність: сторінка показує їх нейтрально
+    local = _health[1]["spi"] or bool(shutil.which("systemctl"))
+    return jsonify({**_health[1], "local": local, "connected": cur_iface() is not None})
 
 
 def chip_cap():

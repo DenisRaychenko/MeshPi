@@ -72,6 +72,12 @@ check("node switching by the viewer is not journalled", not any("/api/conns → 
 check("no password ever reaches the journal", VIEW_PW not in json.dumps(rows) and ADMIN_PW not in json.dumps(rows) and "nope-nope" not in json.dumps(rows))
 anon.post("/api/send", json={"text": "x"})
 check("an anonymous write attempt is journalled without a role", any(r["role"] == "" and r["action"] == "POST /api/send → 401" for r in admin.get("/api/audit").get_json()))
+admin.post("/api/admin/job", json={"op": "read", "section": "lora", "target": "local"})
+admin.post("/api/admin/job", json={"op": "write", "section": "lora", "target": "!000000aa", "value": {"tx_power": 99}})
+acts2 = [r["action"] for r in admin.get("/api/audit").get_json()]
+check("admin reads (POST /api/admin/job op=read) are not journalled", not any("admin/job read" in a for a in acts2))
+check("an admin write is journalled with section and target but without values",
+      any(a.startswith("POST /api/admin/job write lora → !000000aa") for a in acts2) and not any("99" in a for a in acts2), str([a for a in acts2 if "admin" in a]))
 for k in range(2100):
     m.audit("тест")
 n = m.db.execute("SELECT COUNT(*) FROM audit").fetchone()[0]

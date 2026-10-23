@@ -225,10 +225,10 @@
       <button type="button" id="solpos" class="check-btn" title="Підставити позицію вузла">📍 з вузла</button>
       <label>нахил панелі, ° <input class="tg-input" id="soldec" type="number" min="0" max="90" style="width:4.5em"></label>
       <label>азимут, ° (0 південь, −90 схід, 90 захід) <input class="tg-input" id="solaz" type="number" min="-180" max="180" style="width:4.5em"></label>
-      <label>панель, кВт <input class="tg-input" id="solkwp" type="number" step="0.01" min="0.01" style="width:5em"></label>
-      <label>акумулятор, Вт·год <input class="tg-input" id="solcap" type="number" min="0" style="width:6em"></label>
-      <label>споживання вузла, Вт <input class="tg-input" id="solload" type="number" step="0.05" min="0.01" style="width:5em"></label>
-      <label>ККД, 0.3–1 <input class="tg-input" id="soleff" type="number" step="0.05" min="0.3" max="1" style="width:4.5em"></label>
+      <label>панель, кВт <input class="tg-input" id="solkwp" type="number" step="0.01" min="0.01" style="width:6em"></label>
+      <label>акумулятор, Вт·год <input class="tg-input" id="solcap" type="number" min="0" style="width:7em"></label>
+      <label>споживання вузла, Вт <input class="tg-input" id="solload" type="number" step="0.05" min="0.01" style="width:6.5em"></label>
+      <label>ККД, 0.3–1 <input class="tg-input" id="soleff" type="number" step="0.05" min="0.3" max="1" style="width:6.5em"></label>
       <button type="button" id="solsave" class="check-btn">💾 Зберегти й оновити</button><span id="solnote" class="hint"></span>
     </div>
     <div id="solres"></div>
@@ -548,9 +548,12 @@ async function refreshSystem() {
     metrics($('#sys'), [['Температура', n(y.temp, 1), '°C'], ['Процесор', n(y.cpu), '%'], ['Середнє навантаження', n(y.load, 2)],
         ['Пам’ять вільна', pct(y.mem_free, y.mem_total), '%'], ['Диск вільний', pct(y.disk_free, y.disk_total), '%']]);
     const hb = $('#health'); hb.replaceChildren();
-    for (const [k, ok] of [['/dev/spidev0.0', h.spi], ['сервіс meshtasticd: ' + (h.service || '?'), h.service === 'active'],
-        ['проксі API :4404', h.connected]]) {
-      const p = document.createElement('span'); p.className = 'badge ' + (ok ? 'state-idle' : 'state-reboot'); p.textContent = k; hb.append(p);
+    // радіо на іншій платі (панель у Docker на іншому хості): SPI і служба тут не перевіряються, це не несправність
+    const checks = h.local === false
+      ? [['радіо на іншій платі: SPI і служба meshtasticd тут не перевіряються', null], ['зв’язок із вузлом', h.connected]]
+      : [['/dev/spidev0.0', h.spi], ['сервіс meshtasticd: ' + (h.service || '?'), h.service === 'active'], ['проксі API :4404', h.connected]];
+    for (const [k, ok] of checks) {
+      const p = document.createElement('span'); p.className = 'badge' + (ok === null ? '' : ok ? ' state-idle' : ' state-reboot'); p.textContent = k; hb.append(p);
     }
     $('#errs').textContent = h.errors.join('\n');
   } catch (e) { /* див. статус */ }

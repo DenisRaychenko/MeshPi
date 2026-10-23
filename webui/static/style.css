@@ -159,7 +159,7 @@
   }
 
   /* ---- controls ---- */
-  button.reboot-btn, button.check-btn {
+  button.reboot-btn, button.check-btn, a.check-btn {
     font-family:var(--font-mono);
     background: var(--sky-800);
     color: var(--text-hi);
@@ -177,6 +177,7 @@
   .hint {font-family:var(--font-mono); font-size:0.68rem; color:var(--text-low);}
   .leaflet-container {background:var(--sky-900);}  /* без плиток (немає інтернету) карта лишається темною, вузли видно */
   /* журнал подій: мітка виду (колір і слово), заголовки діб, непереглянуті рядки */
+  a.check-btn {text-decoration:none; display:inline-block;}
   .evk {display:inline-block; font-family:var(--font-mono); font-size:0.7rem; padding:2px 9px; border-radius:999px; border:1px solid var(--line); color:var(--text-hi); white-space:nowrap;}
   .evk.new {color:var(--signal); border-color:var(--signal-dim);}
   .evk.fav_off {color:var(--crit); border-color:var(--crit-border);}
@@ -194,8 +195,8 @@
   .hfind .lv {font-family:var(--font-mono); font-size:0.68rem; text-transform:uppercase; letter-spacing:.06em; min-width:5.5em; padding-top:2px; color:var(--text-mid);}
   .evnote {margin:0 0 10px; color:var(--text-mid); font-size:0.82rem; line-height:1.45;}
 
-  button.check-btn:hover {border-color:var(--signal); background:var(--btn-signal-hover-bg);}
-  button.check-btn:active {border-color:var(--signal); background:var(--btn-signal-active-bg);}
+  button.check-btn:hover, a.check-btn:hover {border-color:var(--signal); background:var(--btn-signal-hover-bg);}
+  button.check-btn:active, a.check-btn:active {border-color:var(--signal); background:var(--btn-signal-active-bg);}
   button.check-btn:disabled {opacity:0.5; cursor:not-allowed;}
 
   /* ---- поля введення ---- */
@@ -224,7 +225,7 @@
     /* Більший touch target на дотикових екранах (мінімум ~44px за
        рекомендаціями Apple/Google) - на десктопі кнопки лишаються
        компактнішими, тут лише для мобільних. */
-    button.reboot-btn, button.check-btn {
+    button.reboot-btn, button.check-btn, a.check-btn {
       padding:13px 16px; font-size:0.82rem; min-height:44px;
     }
     .settings-link {width:44px; height:44px;}
