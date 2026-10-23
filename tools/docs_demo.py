@@ -233,4 +233,8 @@ stub("system", lambda: jsonify(temp=47.5, load=0.31, cpu=7.0, mem_free=780, mem_
 stub("health", lambda: jsonify(spi=True, service="active", errors=[], connected=True))
 stub("power", lambda: jsonify(setting=14, logged=14, cap=22, radio="lora-demo.yaml", effective=14, patched=False,
                               running=False, held=False, installed="2.7.0", candidate="2.7.0", log=""))
+# журнал подій для скриншота (вигадані вузли)
+for ago_s, kind, text in ((5400, "new", "Новий вузол Ліс-3 (Лісовий вузол 3)"), (3300, "fav_off", "★ Гора не на зв'язку: не чути 35 хв"),
+                          (1500, "fav_on", "★ Гора знову на зв'язку"), (420, "new", "Новий вузол Дача (Дача-Ретранслятор)")):
+    m.add_event("main", kind, "!00000001", text, now - ago_s)
 m.app.run("127.0.0.1", port)

@@ -167,6 +167,11 @@ def init_db(path):
     # точки на карті (waypoints), прийняті з ефіру й надіслані нами; locked — номер вузла, якому належить редагування
     db.execute("CREATE TABLE IF NOT EXISTS waypoint (owner TEXT NOT NULL, id INT NOT NULL, lat REAL, lon REAL, name TEXT,"
                " descr TEXT, icon INT, expire INT, locked INT, sender TEXT, t INT, ch INT, PRIMARY KEY (owner, id))")
+    # журнал подій (нові вузли, обрані, що пропали й повернулися) і вузли, які панель уже бачила (щоб не сповіщати двічі)
+    db.execute("CREATE TABLE IF NOT EXISTS event (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, t INT,"
+               " kind TEXT, node TEXT, text TEXT)")
+    db.execute("CREATE INDEX IF NOT EXISTS event_owner ON event (owner, id)")
+    db.execute("CREATE TABLE IF NOT EXISTS seen (owner TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY (owner, node))")
     # id пакета, на який відповідь (reply_id), і чи це реакція-емодзі — для реакцій як у застосунку
     cols = {r[1] for r in db.execute("PRAGMA table_info(msg)")}
     # ack: статус доставки приватного повідомлення — 0 надіслано, 1 хтось ретранслював, 2 дійшло до адресата, 3 помилка
@@ -1001,6 +1006,97 @@ def sample():
                 db.execute("DELETE FROM metric WHERE t < ?", (now - 7 * 86400,))
         except sqlite3.Error:
             log.exception("не вдалося записати метрики")
+
+
+# ---- журнал подій: нові вузли та обрані, що пропали (і знову з'явилися) ----
+# «Обрані» — вузли, позначені обраними на самому вузлі (isFavorite): панель бачить їх на сервері, без браузера.
+EV_OFFLINE = int(os.environ.get("MESHPI_FAV_OFFLINE", str(30 * 60)))  # с без чутності, після яких обраний «пропав»
+EV_EVERY = 20       # с між перевірками
+EV_KEEP = 500       # подій на підключення; старіші видаляються
+ev_state: dict[tuple, str] = {}  # (підключення, вузол) -> "off" | "on": пам'ять детектора обраних
+
+
+def add_event(owner, kind, node, text, t=None):
+    with db_lock, db:
+        db.execute("INSERT INTO event (owner, t, kind, node, text) VALUES (?,?,?,?,?)",
+                   (owner, int(t or time.time()), kind, node, text[:200]))
+        db.execute("DELETE FROM event WHERE owner = ? AND id NOT IN (SELECT id FROM event WHERE owner = ?"
+                   " ORDER BY id DESC LIMIT ?)", (owner, owner, EV_KEEP))
+
+
+def age_text(sec):
+    sec = max(int(sec), 0)
+    return f"{sec // 60} хв" if sec < 3600 else f"{sec // 3600} год" if sec < 172800 else f"{sec // 86400} дн"
+
+
+def events_tick(c, now=None):
+    """Один крок детектора для підключення: нові вузли (перший прохід лише запам'ятовує наявні) і обрані вузли,
+    які не чути довше за EV_OFFLINE, а потім знову чутно. Вузли, відомі лише через MQTT-міст, сповіщення не дають."""
+    i = c.iface
+    nodes = all_nodes(i) if i else []
+    if not nodes:
+        return
+    now = now or time.time()
+    try:
+        me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id")
+    except Exception:  # noqa: BLE001
+        me = None
+    items = []
+    for n in nodes:
+        u = n.get("user") or {}
+        nid = u.get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        if nid:
+            name = u.get("shortName") or u.get("longName") or nid
+            long = u.get("longName") or ""
+            items.append((nid, name, long, n))
+    with db_lock:
+        seen = {r[0] for r in db.execute("SELECT node FROM seen WHERE owner = ?", (c.id,))}
+    if seen:
+        for nid, name, long, n in items:
+            if nid in seen or nid == me or n.get("viaMqtt"):
+                continue
+            add_event(c.id, "new", nid, f"Новий вузол {name}" + (f" ({long})" if long and long != name else ""), now)
+    if any(nid not in seen for nid, *_ in items):
+        with db_lock, db:
+            db.executemany("INSERT OR IGNORE INTO seen (owner, node) VALUES (?,?)", [(c.id, nid) for nid, *_ in items])
+    for nid, name, long, n in items:
+        key = (c.id, nid)
+        if not n.get("isFavorite") or nid == me or not n.get("lastHeard"):
+            ev_state.pop(key, None)
+            continue
+        off = now - n["lastHeard"] > EV_OFFLINE
+        st = ev_state.get(key)
+        if st is None:  # після перезапуску панелі: що було востаннє записано про цей вузол
+            with db_lock:
+                row = db.execute("SELECT kind FROM event WHERE owner = ? AND node = ? AND kind IN ('fav_off', 'fav_on')"
+                                 " ORDER BY id DESC LIMIT 1", (c.id, nid)).fetchone()
+            st = {"fav_off": "off", "fav_on": "on"}.get(row[0]) if row else None
+        if off and st != "off":
+            add_event(c.id, "fav_off", nid, f"★ {name} не на зв'язку: не чути {age_text(now - n['lastHeard'])}", now)
+        elif not off and st == "off":
+            add_event(c.id, "fav_on", nid, f"★ {name} знову на зв'язку", now)
+        ev_state[key] = "off" if off else "on"
+
+
+def watcher():
+    while True:
+        time.sleep(EV_EVERY)
+        for c in list(conns.values()):
+            _quiet(lambda c=c: events_tick(c))
+
+
+@app.get("/api/events")
+def api_events():
+    """Журнал подій вибраного вузла, найновіші першими. ?after=id — лише новіші за id; ?limit=1..500 (типово 200)."""
+    try:
+        after, limit = int(request.args.get("after", 0)), min(max(int(request.args.get("limit", 200)), 1), EV_KEEP)
+    except ValueError:
+        return err("after і limit: числа")
+    owner = cur_id()
+    with db_lock:
+        rows = db.execute("SELECT id, t, kind, node, text FROM event WHERE owner = ? AND id > ? ORDER BY id DESC LIMIT ?",
+                          (owner, after, limit)).fetchall()
+    return jsonify(owner=owner, events=[{"id": r[0], "t": r[1], "kind": r[2], "node": r[3], "text": r[4]} for r in rows])
 
 
 def sampler():
@@ -2391,6 +2487,7 @@ if __name__ == "__main__":
     for _c in list(conns.values()):
         threading.Thread(target=conn_loop, args=(_c,), daemon=True).start()
     threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=autotrace, daemon=True).start()
     threading.Thread(target=scan_recover, daemon=True).start()
     # shortcut: HTTP без TLS; для доступу поза домашньою мережею — зворотний проксі з TLS (README, розділ 6)

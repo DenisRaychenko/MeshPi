@@ -10,7 +10,7 @@
     --crit: #ff6b6b;
     --text-hi: #eaf1fb;
     --text-mid: #93a4c3;
-    --text-low: #5b6b8c;
+    --text-low: #7a8aab;  /* було #5b6b8c: 3.2:1 на панелях, для дрібних підказок мало (потрібно 4.5:1) */
     --gradient-start: #101c33;
     --crit-border: #6b2020;
     --btn-crit-hover-bg: #1a1420;
@@ -175,6 +175,14 @@
   button.reboot-btn:active {border-color:var(--crit); background:var(--btn-crit-active-bg);}
   button.reboot-btn:disabled {opacity:0.5; cursor:not-allowed;}
   .hint {font-family:var(--font-mono); font-size:0.68rem; color:var(--text-low);}
+  /* журнал подій: мітка виду (колір і слово), заголовки діб, непереглянуті рядки */
+  .evk {display:inline-block; font-family:var(--font-mono); font-size:0.7rem; padding:2px 9px; border-radius:999px; border:1px solid var(--line); color:var(--text-hi); white-space:nowrap;}
+  .evk.new {color:var(--signal); border-color:var(--signal-dim);}
+  .evk.fav_off {color:var(--crit); border-color:var(--crit-border);}
+  .evk.fav_on {color:var(--warn); border-color:var(--warn);}
+  tr.evday td {font-family:var(--font-mono); font-size:0.68rem; letter-spacing:.08em; text-transform:uppercase; color:var(--text-mid); padding-top:14px;}
+  tr.evnew td:first-child {box-shadow:inset 3px 0 0 var(--signal);}
+  .evnote {margin:0 0 10px; color:var(--text-mid); font-size:0.82rem; line-height:1.45;}
 
   button.check-btn:hover {border-color:var(--signal); background:var(--btn-signal-hover-bg);}
   button.check-btn:active {border-color:var(--signal); background:var(--btn-signal-active-bg);}
