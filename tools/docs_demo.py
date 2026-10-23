@@ -1,6 +1,7 @@
 """Демо-сервер для скриншотів у README: вигадані вузли, повідомлення й показники, без радіо й без жодних
 справжніх даних. Запуск:  python tools/docs_demo.py webui [порт] [--login]
 --login вмикає пароль (demo / demo), щоб зняти сторінку входу."""
+import json
 import math
 import os
 import random
@@ -14,7 +15,7 @@ webui, port = sys.argv[1], int(next((a for a in sys.argv[2:] if a.isdigit()), 80
 tmp = tempfile.mkdtemp()
 os.environ["MESHPI_DB"] = os.path.join(tmp, "messages.db")
 if "--login" in sys.argv:
-    os.environ.update(MESHPI_USER="demo", MESHPI_PASSWORD="demo")
+    os.environ.update(MESHPI_USER="demo", MESHPI_PASSWORD="demo", MESHPI_VIEWER_PASSWORD="demo-viewer-1")
 else:
     os.environ.pop("MESHPI_PASSWORD", None)
 sys.path.insert(0, webui)
@@ -62,6 +63,10 @@ NODES = [
     node(0x200D, "Гість з MQTT", "MQTT", 2, 7.0, 3.0, "CLIENT", None, mqtt=True, heard=4000),
     node(0x200E, "Сусід-клієнт", "SUSD", 1, 1.4, 4.9, "CLIENT", 6.5, heard=120),
 ]
+import base64  # noqa: E402
+for _n in NODES:   # вигадані публічні ключі: у вузлів 0x2007 і 0x2009 однакові (як клони), решта різні
+    _seed = 0x2007 if _n["num"] == 0x2009 else _n["num"]
+    _n["user"]["publicKey"] = base64.b64encode(bytes((_seed * (k + 3) + k) % 251 + 1 for k in range(32))).decode()
 nodes = {n["num"]: n for n in NODES}
 me = {"num": ME, "user": {"id": f"!{ME:08x}", "longName": "Демо-база", "shortName": "DEMO", "role": "CLIENT"},
       "deviceMetrics": {"batteryLevel": 87, "voltage": 4.05, "channelUtilization": 6.2, "airUtilTx": 1.1, "uptimeSeconds": 345600}}
@@ -80,12 +85,13 @@ class DemoIface:
         self.cfg.device.role = 0
         self.cfg.position.position_broadcast_secs = 900
         self.mod.telemetry.device_update_interval = 1800
-        self.mod.mqtt.enabled = False
+        self.mod.mqtt.enabled = True
         chans = []
         for k in range(8):
             ch = channel_pb2.Channel(index=k, role=1 if k == 0 else 0)
             if k < 2:
-                ch.settings.name, ch.settings.psk = ("LongFast" if k == 0 else "Дача"), bytes([1 + k]) * 16
+                ch.settings.name, ch.settings.psk = ("LongFast" if k == 0 else "Дача"), (b"\x01" if k == 0 else bytes(range(1, 33)))
+                ch.settings.uplink_enabled = k == 1
             chans.append(ch)
         self.remote = {"cfg": LC(), "mod": MC(), "chans": chans, "keys": {}}
         self.remote["cfg"].lora.region, self.remote["cfg"].device.role = 2, 2
@@ -237,4 +243,93 @@ stub("power", lambda: jsonify(setting=14, logged=14, cap=22, radio="lora-demo.ya
 for ago_s, kind, text in ((5400, "new", "Новий вузол Ліс-3 (Лісовий вузол 3)"), (3300, "fav_off", "★ Гора не на зв'язку: не чути 35 хв"),
                           (1500, "fav_on", "★ Гора знову на зв'язку"), (420, "new", "Новий вузол Дача (Дача-Ретранслятор)")):
     m.add_event("main", kind, "!00000001", text, now - ago_s)
+
+# ---- дані для скриншотів нових розділів (усе вигадане) ----
+# здоров'я мережі: лічильники LocalStats свого вузла кожні 15 хв, трохи забагато дублікатів
+with m.db_lock, m.db:
+    cnt = {"ls_rx": 0, "ls_dup": 0, "ls_bad": 0, "ls_tx": 0, "ls_rel": 0, "ls_can": 0, "ls_drop": 0}
+    for k, t in enumerate(range(now - 86400, now, 900)):
+        bump = 1.9 if 40 < k % 96 < 60 else 1.0     # ввечері дублікатів більше
+        for key, per in (("ls_rx", 52), ("ls_dup", 9 * bump), ("ls_bad", 4), ("ls_tx", 7), ("ls_rel", 14), ("ls_can", 9), ("ls_drop", 0)):
+            cnt[key] += int(per + (random.random() * 3 if per else 0))
+            m.db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES ('main', ?, ?, ?, ?)", (ID(ME), t, key, cnt[key]))
+        m.db.execute("INSERT INTO tele (owner, node, t, k, v) VALUES ('main', ?, ?, 'ls_noise', ?)", (ID(ME), t, -113 + 2 * math.sin(k / 6) + random.random()))
+    # вимір дальності: «Лісник» іде від бази, 80 пакетів «seq N» за дві години, частину втрачено
+    brg, seq, t0 = 0.2, 0, now - 7200
+    for k in range(80):
+        d = 0.15 + 6.3 * k / 80
+        seq += 1 if random.random() > 0.12 else 2
+        snr = 9 - 3.3 * d + random.random() * 3
+        p = pos(d, brg)
+        m.db.execute("INSERT INTO rangetest (owner, t, node, seq, snr, rssi, hops, lat, lon, dist) VALUES ('main', ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                     (t0 + k * 90, ID(0x2005), seq, snr, snr - 105, p["latitude"], p["longitude"], d))
+    # журнал дій
+    for ago_s, role, user, ip, act in ((7000, "admin", "demo", "10.10.92.5", "вхід"), (6900, "admin", "demo", "10.10.92.5", "POST /api/send → 200"),
+                                       (5200, "", "admin", "10.10.92.77", "невдалий вхід"), (4100, "viewer", "viewer", "10.10.92.41", "вхід"),
+                                       (4000, "viewer", "viewer", "10.10.92.41", "POST /api/send → 403"),
+                                       (3000, "admin", "demo", "10.10.92.5", "POST /api/notify → 200"), (1800, "система", "", "", "автоматика → !00002008: [авто] Meshpi: почув вас за 1 стрибків, SNR 5 (відповідь)"),
+                                       (600, "admin", "demo", "10.10.92.5", "POST /api/viewer → 200")):
+        m.db.execute("INSERT INTO audit (t, role, user, ip, action) VALUES (?,?,?,?,?)", (now - ago_s, role, user, ip, act))
+# журнал пакетів
+for k in range(60):
+    n = random.choice(NODES[1:])
+    ptype = random.choice(["TEXT_MESSAGE_APP", "TELEMETRY_APP", "POSITION_APP", "NODEINFO_APP", "TELEMETRY_APP", "ЗАШИФРОВАНО", "TRACEROUTE_APP"])
+    m.pkt_log.setdefault("main", __import__("collections").deque(maxlen=m.PKT_LOG)).append({
+        "t": now - k * 37, "from": n["user"]["id"], "to": "^all" if k % 3 else ID(ME), "port": ptype, "snr": round(n["snr"] + random.uniform(-2, 2), 1) if n["snr"] is not None else None,
+        "rssi": -90 - random.randint(0, 30), "hops": n["hopsAway"], "relay": f"{n['num'] & 255:02x}" if n["hopsAway"] else None, "mqtt": n["viaMqtt"], "ch": 0, "id": 7000 + k})
+# сповіщення, автоматика й сонячний вузол
+m.notify_cfg["telegram"].update(on=True, token="123456789:" + "A" * 35, chat="-1001234567890")
+m.notify_cfg["kinds"]["new"] = True
+m.auto_cfg["reply"].update(on=True, scope="dm")
+m.auto_cfg["reply"]["rules"] = [{"word": "info", "text": "Meshpi: почув вас за {hops} стрибків, SNR {snr}. Вузлів за годину: {nodes}."},
+                                {"word": "погода", "text": "База: {temp} °C, {hum}%, {press} гПа, заряд {bat}"}]
+m.auto_cfg["announce"].update(on=True, items=[{"id": 1, "text": "CQ від Демо-бази: мережа працює, відповідаємо на «info»", "every": 360, "ch": 0, "quiet_from": 23, "quiet_to": 6}])
+m.SOLAR_FILE = os.path.join(tmp, "solar.json")
+open(m.SOLAR_FILE, "w").write(json.dumps({"main": {"on": True, "lat": LAT, "lon": LON, "dec": 35, "az": 0, "kwp": 0.1, "cap_wh": 24.0, "load_w": 0.45, "eff": 0.75}}))
+me["deviceMetrics"]["batteryLevel"] = 58
+
+
+def demo_fetch(url, **kw):
+    """Підставні відповіді open-meteo.com і forecast.solar: у демо нічого не йде в інтернет."""
+    if "elevation" in url:
+        n = url.split("latitude=")[1].split("&")[0].count(",") + 1
+        return {"elevation": [185 + 22 * math.exp(-((k - n * 0.55) / (n * 0.09)) ** 2) + 6 * math.sin(k / 9) for k in range(n)]}
+    off = time.localtime(now).tm_gmtoff
+    iso = lambda t, o=off: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t + o)) + f"{'+' if o >= 0 else '-'}{abs(o) // 3600:02d}:{abs(o) % 3600 // 60:02d}"  # noqa: E731
+    watts, days = {}, {}
+    for day in (0, 1):
+        t0 = (now // 86400 + day) * 86400 - off          # північ за місцевим часом
+        for h in range(7, 18):
+            w = max(0, 78 * math.sin(math.pi * (h - 7) / 10)) * (1 if day == 0 else 0.45)   # завтра похмуро
+            watts[time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t0 + h * 3600 + off))] = round(w)
+            days[time.strftime("%Y-%m-%d", time.gmtime(t0 + off))] = days.get(time.strftime("%Y-%m-%d", time.gmtime(t0 + off)), 0) + round(w)
+    return {"result": {"watts": watts, "watt_hours_day": days}, "message": {"info": {"time": iso(now), "time_utc": iso(now, 0)}, "ratelimit": {"period": 3600, "limit": 12, "remaining": 9}}}
+
+
+m.fetch_json = demo_fetch
+# роль адміністратора з увімкненим входом і роллю «лише перегляд»: так виглядає розділ «Доступ» на скриншоті
+stub("api_whoami", lambda: jsonify(role="admin", auth=True, viewer=True, viewer_user="viewer"))
+
+
+@m.app.after_request
+def shot_helper(resp):
+    """Лише в демо: ?shot=<id секції>[&click=<id кнопок>][&set=<id:значення,…>] залишає на сторінці лише цю секцію вкладки після
+    завантаження (для знімків headless Chrome, див. docs/WEB-PANEL.md): спершу set, потім click."""
+    import re
+    from flask import request as rq
+    sid = rq.args.get("shot")
+    if not (sid and resp.mimetype == "text/html" and re.fullmatch(r"\w+", sid)):
+        return resp
+    click = ",".join(x for x in rq.args.get("click", "").split(",") if re.fullmatch(r"\w+", x))
+    sets = [x.split(":", 1) for x in rq.args.get("set", "").split(",") if re.fullmatch(r"\w+:[\w!.-]+", x)]
+    js = ("<script>addEventListener('load',()=>setTimeout(()=>{for(const [i,v] of %s){const e=document.getElementById(i); if(e){e.value=v;}}"
+          "for(const b of %r.split(',')) if (b) document.getElementById(b)?.click();"
+          "setTimeout(()=>{const sec=document.getElementById(%r).closest('section'), pane=sec.closest('.tabpane');"
+          "for(const p of pane.querySelectorAll(':scope > section.panel, :scope > .strip')) if(p!==sec) p.style.display='none';}, %d);}, 2500));</script>"
+          % (json.dumps(sets), click, sid, 5000 if click else 800))
+    resp.set_data(resp.get_data(as_text=True).replace("</body>", js + "</body>"))
+    resp.headers.pop("Content-Length", None)
+    return resp
+
+
 m.app.run("127.0.0.1", port)
