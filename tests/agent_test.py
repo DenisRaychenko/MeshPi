@@ -33,6 +33,28 @@ check("config without the key: the usual 22", agent.chip_cap() == (22, None))
 open(os.path.join(cfgdir, "lora-e32-400m30s.yaml"), "w").write("Lora:\n  Module: RF95\n  RF95_MAX_POWER: 8\n")
 check("RF95_MAX_POWER is found with the name of its config", agent.chip_cap() == (8, "lora-e32-400m30s.yaml"))
 
+# запам'ятовування: рядок «Set radio» зникає з журналу в пам'яті за кілька годин, а значення має лишитись, доки радіо не перезапущено
+agent.STATE = os.path.join(tmp, "state.json"); agent._state = {}
+keys = {"k": "boot1:100"}
+agent.start_key = lambda: keys["k"]
+agent.journal_text = lambda: "Final Tx power: 8\nSet radio: power=20\n"
+check("fresh journal: values read and not marked as cached", agent.refresh() is True and agent._state["logged"] == 20 and agent._state["final"] == 8)
+agent.journal_text = lambda: ""                      # рядки стерлись із журналу
+agent.refresh()
+check("lines gone from the journal, same start: the last seen values stay", agent._state["logged"] == 20 and agent._state["final"] == 8)
+agent._state = {}; agent.load_state()
+check("they survive an agent restart (state file)", agent._state.get("logged") == 20 and agent._state.get("key") == "boot1:100")
+keys["k"] = "boot1:999"; agent.refresh()
+check("meshtasticd restarted and the journal has no lines yet: the old values are dropped", agent._state["logged"] is None and agent._state["final"] is None)
+agent.journal_text = lambda: "Set radio: power=12\n"; agent.refresh()
+check("new start, new line: the new value", agent._state["logged"] == 12 and agent._state["key"] == "boot1:999")
+keys["k"] = None; agent.journal_text = lambda: ""; agent.refresh()
+check("start key unknown (systemctl unavailable): the cache is kept, not wiped", agent._state["logged"] == 12)
+agent._state = {}; agent.STATE = os.path.join(tmp, "missing-dir", "state.json"); agent.refresh()
+agent._cache = (0.0, {}); check("no writable state directory: still answers from memory", "logged" in agent.radio_info())
+agent._state = {}; agent.STATE = os.path.join(tmp, "state2.json")
+keys["k"] = "b:1"; agent.journal_text = lambda: (calls.append(1), JOURNAL)[1]; agent._cache = (0.0, {})
+
 srv = ThreadingHTTPServer(("127.0.0.1", 0), agent.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 base = f"http://127.0.0.1:{srv.server_address[1]}"
@@ -67,6 +89,7 @@ c = m.app.test_client()
 r = c.get("/api/power").get_json()
 check("without agent and outside the Pi: no invented chip cap, source unknown", r["cap"] is None and r["effective"] is None and r["source"] is None
       and r["patched"] is None and r["setting"] == 10, str({k: r[k] for k in ("cap", "effective", "source", "patched")}))
+check("no journal data, node setting known: an estimate, clearly flagged, without the region limit", r["estimate"] is True and r["logged"] == 10 and r["setting"] == 10)
 bad = {"action": "update", "id": "main", "name": "Основний", "host": "localhost", "port": 4404}
 check("agent url must be http(s)://host[:port]", all(c.post("/api/conns", json={**bad, "agent": u, "agent_token": TOKEN}).status_code == 400
       for u in ("ftp://x", "http://user:pw@x", "http://x/path", "http://x?y=1", "http://x:99999", "javascript:1", "x")))
@@ -78,7 +101,7 @@ check("agent saved (trailing slash dropped); the token never goes to the browser
       main["agent"] == base and main["agent_token_set"] is True and TOKEN not in json.dumps(j) and TOKEN not in c.get("/api/conns").get_data(as_text=True))
 check("nodes.json keeps the token for the next start", json.load(open(m.NODES_FILE))[0]["agent_token"] == TOKEN)
 r = c.get("/api/power").get_json()
-check("/api/power takes the four values from the agent", r["source"] == "agent" and r["logged"] == 20 and r["effective"] == 8 and r["cap"] == 8
+check("/api/power takes the four values from the agent (not an estimate)", r["estimate"] is False and r["source"] == "agent" and r["logged"] == 20 and r["effective"] == 8 and r["cap"] == 8
       and r["radio"] == "lora-e32-400m30s.yaml" and r["agent_error"] is None, str(r))
 j = c.post("/api/conns", json={**bad}).get_json()
 check("editing without agent fields keeps the agent and its token", next(x for x in j["conns"] if x["id"] == "main")["agent"] == base

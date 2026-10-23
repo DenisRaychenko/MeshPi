@@ -59,6 +59,8 @@ User=meshagent
 Group=meshagent
 SupplementaryGroups=systemd-journal
 EnvironmentFile=$ENVF
+StateDirectory=mesh-radio-agent
+Environment=AGENT_STATE=/var/lib/mesh-radio-agent/state.json
 ExecStart=/usr/bin/python3 $LIB/mesh-radio-agent.py
 Restart=always
 RestartSec=5

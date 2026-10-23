@@ -884,8 +884,9 @@ async function refreshPower() {
   try {
     const p = await api('/api/power');
     const f = v => v == null ? ['—'] : [v, 'дБм'];
-    metrics($('#pwr'), [['Задано', ...f(p.setting)], ['Після ліміту регіону', ...f(p.logged)],
-        ['Стеля чипа (конфіг)', ...f(p.cap)], ['Фактично на виході чипа', ...f(p.effective)],
+    const fe = v => v == null ? ['—'] : [(p.estimate ? '≈ ' : '') + v, 'дБм'];  // ≈ — оцінка, а не рядок із журналу
+    metrics($('#pwr'), [['Задано', ...f(p.setting)], ['Після ліміту регіону', ...fe(p.logged)],
+        ['Стеля чипа (конфіг)', ...f(p.cap)], ['Фактично на виході чипа', ...fe(p.effective)],
         ['Прошивка', p.patched == null ? '—' : p.patched ? 'змінена' : 'стандартна']]);
     fillPowerTable(p.radio);
     $('#cap').max = /ra-01|rfm98pw/i.test(p.radio || '') ? 20 : 22;  // SX1278 — до 20 дБм (raise-power.sh інакше відмовить)
@@ -893,6 +894,9 @@ async function refreshPower() {
     const t = antTable(p.radio);
     $('#pwrnote').textContent = p.agent_error
       ? `Агент на Pi: ${p.agent_error}. Перевірте адресу й токен у «Система → Вузли панелі».`
+      : p.estimate
+      ? '≈ — оцінка за заданою потужністю, ліміт регіону не враховано: рядок «Set radio» уже стерся з журналу meshtasticd (журнал у пам’яті ' +
+        'тримає його лише години). Точні значення з’являться після перезапуску meshtasticd; новий агент на Pi запам’ятовує їх надовго.'
       : p.source == null && p.logged == null && p.cap == null
         ? 'Журнал і конфіги meshtasticd є лише на самій Pi. Щоб тут були «Після ліміту регіону», «Стеля чипа» й «Фактично на виході чипа», ' +
           'встановіть агента на Pi (папка pi-agent) і вкажіть його адресу та токен у «Система → Вузли панелі» (✎ біля вузла).'

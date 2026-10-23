@@ -26,6 +26,9 @@
   (`ProtectSystem=strict`, `NoNewPrivileges`, без capabilities, лише TCP-сокети).
 - `GET /ping` повертає «ok» без жодних даних (перевірка, що служба жива).
 - Журнал кешується на 10 с: `journalctl` на Pi важкий, навіть коли панель питає щохвилини.
+- **Запам'ятовує значення.** Рядок `Set radio` з'являється в журналі лише при старті радіо, а журнал на Pi лежить у пам'яті й за кілька годин
+  стирає старе. Тому агент раз на хвилину дивиться в журнал і зберігає останнє значення (`/var/lib/mesh-radio-agent/state.json`). Воно
+  чинне, доки `meshtasticd` не перезапущено (тоді старе скидається й чекає нового рядка). У відповіді `"cached": true` означає «з пам'яті агента».
 
 ## Встановлення
 
@@ -61,7 +64,7 @@ ssh -t chechen@<адреса-Pi> 'sudo bash ~/install.sh'
 ```bash
 curl -s http://127.0.0.1:8097/ping                                    # на Pi: ok
 curl -s -H "Authorization: Bearer <токен>" http://<адреса-Pi>:8097/radio.json
-# {"logged": 10, "final": null, "cap": 22, "radio": null, "t": 1792737736}
+# {"logged": 10, "final": null, "cap": 22, "radio": null, "cached": false, "seen": 1792737736, "t": 1792737736}
 systemctl status mesh-radio-agent
 sudo journalctl -u mesh-radio-agent -n 20
 ```

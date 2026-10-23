@@ -1331,13 +1331,18 @@ def power():
         logged, final = (lg[0] if lg else None), (fn[0] if fn else None)
         cap, radio = chip_cap()
         source = "local" if (exe or logged is not None or cap is not None) else None
+    setting = i.localNode.localConfig.lora.tx_power if i else None
+    estimate = False
+    if logged is None and final is None and setting:
+        # рядок «Set radio» живе в журналі лише години (журнал у пам'яті): оцінюємо за заданою потужністю, без ліміту регіону
+        logged, estimate = setting, True
     if final is not None:
         effective = final
     else:
         effective = min(logged, cap) if logged is not None and cap is not None else None
     native = bool(exe)  # meshtasticd встановлено тут: «змінена прошивка» і пакети мають сенс лише тоді
     return jsonify(
-        setting=i.localNode.localConfig.lora.tx_power if i else None,
+        setting=setting, estimate=estimate,
         logged=logged, cap=cap, radio=radio, effective=effective, source=source, agent_error=agent_error, agent=bool(c.agent),
         patched=bool(exe and Path(exe + ".stock").exists()) if native else None,
         running=build_running(), **package_state(),
