@@ -184,6 +184,8 @@ def init_db(path):
     # журнал подій (нові вузли, обрані, що пропали й повернулися) і вузли, які панель уже бачила (щоб не сповіщати двічі)
     db.execute("CREATE TABLE IF NOT EXISTS event (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, t INT,"
                " kind TEXT, node TEXT, text TEXT)")
+    if "mqtt" not in {r[1] for r in db.execute("PRAGMA table_info(event)")}:  # база попередньої версії
+        db.execute("ALTER TABLE event ADD COLUMN mqtt INT NOT NULL DEFAULT 0")
     db.execute("CREATE INDEX IF NOT EXISTS event_owner ON event (owner, id)")
     db.execute("CREATE TABLE IF NOT EXISTS seen (owner TEXT NOT NULL, node TEXT NOT NULL, PRIMARY KEY (owner, node))")
     # вимір дальності (Range Test): кожен прийнятий пакет «seq N» із SNR/RSSI і відстанню до відправника
@@ -1280,14 +1282,15 @@ ALERT_LEVEL = {"geo_in": "info", "geo_out": "info", "fav_off": "warn", "bat_low"
 alert_state: dict[str, dict] = {}  # пам'ять порогових тривог по підключеннях (extras.alerts)
 
 
-def add_event(owner, kind, node, text, t=None):
+def add_event(owner, kind, node, text, t=None, mqtt=False):
+    """mqtt: подія про вузол, відомий лише через MQTT-міст: пишемо з позначкою (журнал їх ховає за замовчуванням), без сповіщень."""
     with db_lock, db:
-        db.execute("INSERT INTO event (owner, t, kind, node, text) VALUES (?,?,?,?,?)",
-                   (owner, int(t or time.time()), kind, node, text[:200]))
+        db.execute("INSERT INTO event (owner, t, kind, node, text, mqtt) VALUES (?,?,?,?,?,?)",
+                   (owner, int(t or time.time()), kind, node, text[:200], int(bool(mqtt))))
         db.execute("DELETE FROM event WHERE owner = ? AND id NOT IN (SELECT id FROM event WHERE owner = ?"
                    " ORDER BY id DESC LIMIT ?)", (owner, owner, EV_KEEP))
     cfg = notify_cfg
-    if cfg["kinds"].get(kind) and any(cfg[ch]["on"] for ch in ("telegram", "ntfy", "webhook")):
+    if not mqtt and cfg["kinds"].get(kind) and any(cfg[ch]["on"] for ch in ("telegram", "ntfy", "webhook")):
         c = conns.get(owner)
         notify.send_async(cfg, f"Meshpi · {c.name}" if c else "Meshpi", text, ALERT_LEVEL.get(kind, "info"), log)
 
@@ -1807,9 +1810,10 @@ def events_tick(c, now=None):
         seen = {r[0] for r in db.execute("SELECT node FROM seen WHERE owner = ?", (c.id,))}
     if seen:
         for nid, name, long, n in items:
-            if nid in seen or nid == me or n.get("viaMqtt"):
+            if nid in seen or nid == me:
                 continue
-            add_event(c.id, "new", nid, f"Новий вузол {name}" + (f" ({long})" if long and long != name else ""), now)
+            add_event(c.id, "new", nid, f"Новий вузол {name}" + (f" ({long})" if long and long != name else ""), now,
+                      mqtt=bool(n.get("viaMqtt")))
     if any(nid not in seen for nid, *_ in items):
         with db_lock, db:
             db.executemany("INSERT OR IGNORE INTO seen (owner, node) VALUES (?,?)", [(c.id, nid) for nid, *_ in items])
@@ -1826,9 +1830,10 @@ def events_tick(c, now=None):
                                  " ORDER BY id DESC LIMIT 1", (c.id, nid)).fetchone()
             st = {"fav_off": "off", "fav_on": "on"}.get(row[0]) if row else None
         if off and st != "off":
-            add_event(c.id, "fav_off", nid, f"★ {name} не на зв'язку: не чути {age_text(now - n['lastHeard'])}", now)
+            add_event(c.id, "fav_off", nid, f"★ {name} не на зв'язку: не чути {age_text(now - n['lastHeard'])}", now,
+                      mqtt=bool(n.get("viaMqtt")))
         elif not off and st == "off":
-            add_event(c.id, "fav_on", nid, f"★ {name} знову на зв'язку", now)
+            add_event(c.id, "fav_on", nid, f"★ {name} знову на зв'язку", now, mqtt=bool(n.get("viaMqtt")))
         ev_state[key] = "off" if off else "on"
 
 
@@ -1851,9 +1856,10 @@ def api_events():
         return err("after і limit: числа")
     owner = cur_id()
     with db_lock:
-        rows = db.execute("SELECT id, t, kind, node, text FROM event WHERE owner = ? AND id > ? ORDER BY id DESC LIMIT ?",
+        rows = db.execute("SELECT id, t, kind, node, text, mqtt FROM event WHERE owner = ? AND id > ? ORDER BY id DESC LIMIT ?",
                           (owner, after, limit)).fetchall()
-    return jsonify(owner=owner, events=[{"id": r[0], "t": r[1], "kind": r[2], "node": r[3], "text": r[4]} for r in rows])
+    return jsonify(owner=owner, events=[{"id": r[0], "t": r[1], "kind": r[2], "node": r[3], "text": r[4], "mqtt": bool(r[5])}
+                                        for r in rows])
 
 
 # ---- нормалізований список вузлів для аналітики: проблеми, покриття, «Останні показники», геозони ----

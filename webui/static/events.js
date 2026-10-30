@@ -20,12 +20,17 @@
     if (notify.checked && window.Notification && Notification.permission === 'default') Notification.requestPermission();
   };
 
+  const withMqtt = $id('evmqtt');
+  withMqtt.checked = store.get('evmqtt', '0') === '1';  // типово без MQTT
+  withMqtt.onchange = () => { store.set('evmqtt', withMqtt.checked ? '1' : '0'); render(); badge(); };
+  const shown = () => withMqtt.checked ? list : list.filter(e => !e.mqtt);
+
   const active = () => tab.classList.contains('active');
   const seenKey = () => 'evseen:' + owner;
   const seenId = () => Number(store.get(seenKey(), '0')) || 0;
 
   function badge() {
-    const n = active() ? 0 : list.filter(e => e.id > seenId()).length;
+    const n = active() ? 0 : shown().filter(e => e.id > seenId()).length;
     $id('evbadge').textContent = n ? ` ${n > 99 ? '99+' : n}` : '';
     $id('evbadge').style.color = n ? 'var(--warn, #e3b341)' : '';
   }
@@ -43,10 +48,11 @@
 
   function render() {
     rows.replaceChildren();
-    $id('evempty').hidden = list.length > 0;
+    const view = shown();
+    $id('evempty').hidden = view.length > 0;
     const fresh = seenId();
     let day = '';
-    for (const e of list) {
+    for (const e of view) {
       const when = new Date(e.t * 1000), d = when.toDateString();
       if (d !== day) {  // заголовок доби
         day = d;
@@ -79,7 +85,8 @@
     const fresh = r.events.filter(e => e.id > top);
     list = r.events;
     if (list.length) top = Math.max(top, list[0].id);
-    if (!first && fresh.length) alertNew(fresh);
+    const loud = withMqtt.checked ? fresh : fresh.filter(e => !e.mqtt);
+    if (!first && loud.length) alertNew(loud);
     first = false;
     render();
     if (active()) markSeen(); else badge();

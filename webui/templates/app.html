@@ -150,9 +150,10 @@
   <div class="tabpane" data-tab="events" role="tabpanel" hidden>
 <section class="panel">
     <h2>Події</h2>
-    <p class="evnote">Новий вузол у мережі; обраний ★ (позначений на самому вузлі), якого не чути понад 30 хв, і його повернення. Вузли, відомі лише через MQTT, не враховуються.</p>
+    <p class="evnote">Новий вузол у мережі; обраний ★ (позначений на самому вузлі), якого не чути понад 30 хв, і його повернення. Події про вузли, відомі лише через MQTT, типово приховані й без сповіщень.</p>
     <div class="row" style="margin-bottom:8px">
       <label title="Звук і системне сповіщення про нові вузли та обраних, що пропали; лише в цьому браузері"><input type="checkbox" id="evnotify"> 🔔 сповіщати про нові події</label>
+      <label title="Показати й події про вузли, відомі лише через MQTT-міст, а не з радіоефіру"><input type="checkbox" id="evmqtt"> з MQTT</label>
     </div>
     <div class="table-wrap"><table>
       <thead><tr><th>Коли</th><th>Що</th><th>Подія</th></tr></thead>

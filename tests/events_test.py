@@ -65,10 +65,14 @@ m.events_tick(conn, now + 90)
 check("... and not again", len(events()[1]["events"]) == 1)
 fi.put(node(0x302, "Bridge", now + 100, mqtt=True))
 m.events_tick(conn, now + 120)
-check("a node known only through MQTT is remembered but not announced", len(events()[1]["events"]) == 1)
+ev = events()[1]["events"]
+check("a node known only through MQTT is logged, flagged mqtt, so the journal can hide it",
+      len(ev) == 2 and ev[0]["mqtt"] is True and ev[1]["mqtt"] is False, str(ev))
+html = c.get("/").get_data(as_text=True) if hasattr(c, "get") else ""
+check("the events tab has the 'з MQTT' checkbox, off by default", 'id="evmqtt"' in html and 'id="evmqtt" checked' not in html)
 fi.put(node(0x302, "Bridge", now + 130))  # the same node later heard on the radio is no longer new
 m.events_tick(conn, now + 140)
-check("... and does not become 'new' later", len(events()[1]["events"]) == 1)
+check("... and does not become 'new' later", len(events()[1]["events"]) == 2)
 
 # favourites
 t = now + 200
@@ -104,7 +108,7 @@ check("newest first", [e["id"] for e in allv] == sorted((e["id"] for e in allv),
 check("?after returns only newer events", [e["id"] for e in events(after=allv[1]["id"])[1]["events"]] == [allv[0]["id"]])
 check("?limit", len(events(limit=2)[1]["events"]) == 2)
 check("bad parameters are refused", events(after="x")[0] == 400 and events(limit="y")[0] == 400)
-check("events have the fields the page needs", set(allv[0]) == {"id", "t", "kind", "node", "text"})
+check("events have the fields the page needs", set(allv[0]) == {"id", "t", "kind", "node", "text", "mqtt"})
 
 # separate journals per connection
 c.post("/api/conns", json={"action": "add", "name": "Дача", "host": "node2.test", "port": 4403})
