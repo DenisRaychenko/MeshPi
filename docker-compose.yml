@@ -10,7 +10,7 @@ services:
       MESH_HOST: ${MESH_HOST:?set MESH_HOST in .env}   # Pi with the radio: mesh-proxy (multi-client) or meshtasticd; address lives in .env, not in git
       MESH_PORT: ${MESH_PORT:-4403}
     ports:
-      - "${MESHPI_BIND:-127.0.0.1}:8090:8080"   # MESHPI_BIND in .env: the host's LAN address (default: this host only)
+      - "${MESHPI_PUBLISH:-127.0.0.1}:8090:8080"   # MESHPI_PUBLISH in .env: the host's LAN address (default: this host only)
     volumes:
       - ./data:/data
     read_only: true
