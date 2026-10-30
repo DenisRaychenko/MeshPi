@@ -9,10 +9,12 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -163,6 +165,7 @@ def init_db(path):
     if "db" in globals():
         db.close()  # тести перевідкривають базу
     db = sqlite3.connect(path, check_same_thread=False)  # доступ під db_lock
+    db.create_function("casefold", 1, lambda v: v.casefold() if isinstance(v, str) else v, deterministic=True)  # LIKE сам не розрізняє регістр лише в ASCII
     # WAL + NORMAL: менше записів і fsync на флешку; при втраті живлення можуть пропасти лише останні записи
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
@@ -461,7 +464,7 @@ def _viewer_stamp():
 # що може глядач: лише ці GET (перелік дозволеного, а не заборонного: новий маршрут за замовчуванням закритий) і вибір вузла
 VIEWER_GET = {"/", "/settings", "/api/whoami", "/api/status", "/api/nodes", "/api/messages", "/api/mesh", "/api/telemetry",
               "/api/history", "/api/env", "/api/events", "/api/netstats", "/api/health", "/api/waypoints", "/api/packets",
-              "/api/live", "/api/packets.csv", "/api/conns", "/api/rangetest", "/api/rangetest.csv"}
+              "/api/live", "/api/packets.csv", "/api/conns", "/api/issues", "/api/coverage", "/api/latest", "/api/messages/search", "/api/rangetest", "/api/rangetest.csv"}
 
 
 def viewer_allowed(method, path):
@@ -1273,7 +1276,7 @@ ev_state: dict[tuple, str] = {}  # (підключення, вузол) -> "off"
 
 NOTIFY_FILE = os.environ.get("MESHPI_NOTIFY_FILE", str(Path(DB_PATH).with_name("notify.json")))  # токени каналів, права 600
 notify_cfg = notify.load(NOTIFY_FILE)
-ALERT_LEVEL = {"fav_off": "warn", "bat_low": "warn", "chan_high": "warn", "reboot": "warn", "link_lost": "crit"}
+ALERT_LEVEL = {"geo_in": "info", "geo_out": "info", "fav_off": "warn", "bat_low": "warn", "chan_high": "warn", "reboot": "warn", "link_lost": "crit"}
 alert_state: dict[str, dict] = {}  # пам'ять порогових тривог по підключеннях (extras.alerts)
 
 
@@ -1468,9 +1471,13 @@ def auto_on_text(packet, i):
     if Path(PONGFILE).exists() and word in PING_WORDS:
         return  # «ping» уже обробляє проста автовідповідь PONG: не відповідаємо двічі
     hs = packet.get("hopStart")
+    hops = hs - (packet.get("hopLimit") or 0) if hs else None
+    relay = packet.get("relayNode")
+    via = resolve_relay(i, relay, {mid, sender}) if isinstance(relay, int) and hops != 0 else None  # хто передав нам пакет останнім
     msg = {"text": str(dec.get("text") or ""), "sender": sender, "sender_name": node_name(i, sender) if sender else None,
            "dm": dest_of(packet) == mid, "mqtt": bool(packet.get("viaMqtt")), "own": sender == mid, "t": packet.get("rxTime"),
-           "hops": hs - (packet.get("hopLimit") or 0) if hs else None, "snr": packet.get("rxSnr"), "rssi": packet.get("rxRssi")}
+           "hops": hops, "snr": packet.get("rxSnr"), "rssi": packet.get("rxRssi"),
+           "via_name": (node_name(i, via) if via else (node_name(i, sender) if hops == 0 and sender else None))}
     with auto_lock:
         text, why = extras.auto_reply(auto_cfg, auto_state, msg, auto_ctx(i, owner, auto_cfg["reply"]["per_hour"]))
         if text:
@@ -1478,7 +1485,63 @@ def auto_on_text(packet, i):
     if not text:
         return
     to, ch = (sender if msg["dm"] else "^all"), packet.get("channel", 0)
-    threading.Thread(target=lambda: _quiet(lambda: auto_transmit(i, owner, text, to, ch, packet.get("id"), "відповідь")), daemon=True).start()
+    wait = random.uniform(max(1, auto_cfg["reply"].get("jitter", 0) // 5), auto_cfg["reply"]["jitter"])         if auto_cfg["reply"].get("jitter") and not msg["dm"] else 0   # у каналі випадкова пауза, щоб кілька станцій не відповідали хором
+
+    def go():
+        t = text
+        if isinstance(t, extras.Job):
+            t = extras.job_text(t, run_job(t, packet, mid))
+        if wait:
+            time.sleep(wait)
+        if t:
+            auto_transmit(i, owner, t, to, ch, packet.get("id"), "відповідь")
+    threading.Thread(target=lambda: _quiet(go), daemon=True).start()
+
+
+SCRIPTS_DIR = Path(os.environ.get("MESHPI_SCRIPTS_DIR", str(Path(DB_PATH).with_name("scripts"))))
+SCRIPT_TIMEOUT, SCRIPT_OUT, HTTP_OUT = 30, 1_000_000, 4000
+
+
+def script_files():
+    try:
+        return sorted(f.name for f in SCRIPTS_DIR.iterdir() if f.is_file() and extras.SCRIPT_RE.match(f.name))
+    except OSError:
+        return []
+
+
+def run_job(job, packet, my_id):
+    """Відповідь автовідповідача з HTTP чи скрипта. Скрипт лише з каталогу data/scripts (його кладе адміністратор на хості), без
+    шляхів, з таймаутом, ліміт виводу, і без змінних середовища панелі (там паролі). Помилка = відповіді немає."""
+    rule, v = job.rule, job.values
+    if rule["kind"] == "http":
+        if NO_EXTERNAL:
+            return None
+        url = extras.auto_render(rule["target"], v, enc=lambda x: quote(x, safe=""))
+        try:
+            with urllib.request.build_opener(_NoRedirectExt).open(urllib.request.Request(url, headers={"User-Agent": "meshpi (self-hosted)"}), timeout=8) as r:
+                return r.read(HTTP_OUT).decode("utf-8", "replace")
+        except (OSError, ValueError):
+            log.warning("автовідповідач: HTTP-правило «%s» не відповіло", rule["word"])
+            return None
+    path = (SCRIPTS_DIR / rule["target"]).resolve()
+    if path.parent != SCRIPTS_DIR.resolve() or not path.is_file():
+        return None
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "MESSAGE": job.msg["text"][:200], "FROM_NODE": job.msg.get("sender_name") or "",
+           "NODE_ID": job.msg.get("sender") or "", "HOPS": str(job.msg.get("hops") if job.msg.get("hops") is not None else ""),
+           "SNR": str(job.msg.get("snr") if job.msg.get("snr") is not None else ""), "RSSI": str(job.msg.get("rssi") if job.msg.get("rssi") is not None else "")}
+    cmd = [sys.executable, "-I", str(path)] if path.suffix == ".py" else ["sh", str(path)]
+    try:
+        with subprocess.Popen(cmd, cwd=str(SCRIPTS_DIR), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as pr:
+            try:
+                out, _ = pr.communicate(timeout=SCRIPT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pr.kill()
+                pr.communicate()
+                log.warning("автовідповідач: скрипт %s перевищив %s с", path.name, SCRIPT_TIMEOUT)
+                return None
+        return out[:SCRIPT_OUT].decode("utf-8", "replace") if pr.returncode == 0 else None
+    except OSError:
+        return None
 
 
 def auto_tick(c, now=None):
@@ -1498,7 +1561,7 @@ def auto_tick(c, now=None):
 def api_auto_get():
     with auto_lock:
         sent = len([t for t in auto_state.get("sent", []) if time.time() - t < 3600])
-    return jsonify(cfg=auto_cfg, sent_last_hour=sent, placeholders=list(extras.PLACEHOLDERS), prefix=extras.BOT_PREFIX,
+    return jsonify(cfg=auto_cfg, sent_last_hour=sent, placeholders=list(extras.PLACEHOLDERS), prefix=extras.BOT_PREFIX, scripts=script_files(),
                    limits={"cooldown_min": 60, "every_min": 60, "text_bytes": extras.AUTO_TEXT_BYTES})
 
 
@@ -1776,6 +1839,7 @@ def watcher():
             _quiet(lambda c=c: alerts_tick(c))
             _quiet(lambda c=c: events_tick(c))
             _quiet(lambda c=c: auto_tick(c))
+            _quiet(lambda c=c: geo_tick(c))
 
 
 @app.get("/api/events")
@@ -1790,6 +1854,149 @@ def api_events():
         rows = db.execute("SELECT id, t, kind, node, text FROM event WHERE owner = ? AND id > ? ORDER BY id DESC LIMIT ?",
                           (owner, after, limit)).fetchall()
     return jsonify(owner=owner, events=[{"id": r[0], "t": r[1], "kind": r[2], "node": r[3], "text": r[4]} for r in rows])
+
+
+# ---- нормалізований список вузлів для аналітики: проблеми, покриття, «Останні показники», геозони ----
+AIRCRAFT_M = int(os.environ.get("MESHPI_AIRCRAFT_M", "1000"))   # вузол вище за це (м н.р.м.) позначаємо як ймовірний літак
+
+
+def node_rows(i):
+    me = ((i.getMyNodeInfo() or {}).get("user") or {}).get("id") if i else None
+    out = []
+    for n in all_nodes(i):
+        u, p, dm = n.get("user") or {}, n.get("position") or {}, n.get("deviceMetrics") or {}
+        nid = u.get("id") or (node_id(n["num"]) if isinstance(n.get("num"), int) else None)
+        if not nid:
+            continue
+        out.append({"id": nid, "name": u.get("shortName") or u.get("longName") or nid, "long": u.get("longName"), "role": u.get("role") or "CLIENT",
+                    "hops": n.get("hopsAway"), "snr": n.get("snr"), "heard": n.get("lastHeard"), "lat": p.get("latitude"), "lon": p.get("longitude"),
+                    "alt": p.get("altitude"), "air_tx": dm.get("airUtilTx"), "chan_util": dm.get("channelUtilization"),
+                    "bat": dm.get("batteryLevel"), "volt": dm.get("voltage"), "uptime": dm.get("uptimeSeconds"),
+                    "fav": bool(n.get("isFavorite")), "mqtt": bool(n.get("viaMqtt")), "me": nid == me})
+    return out
+
+
+def my_position(i, rows):
+    """Свої координати: з вузла, інакше задані в налаштуваннях розташування."""
+    for r in rows:
+        if r["me"] and r["lat"] is not None and r["lon"] is not None and not (r["lat"] == 0 and r["lon"] == 0):
+            return r["lat"], r["lon"]
+    h = home()
+    return (h["lat"], h["lon"]) if h else None
+
+
+@app.get("/api/issues")
+def api_issues():
+    """Підказки про проблеми мережі зі списку вузлів і журналу пакетів. Лише читання, в ефір нічого не йде."""
+    i = need()
+    rows, owner = node_rows(i), cur_id()
+    me = next((r["id"] for r in rows if r["me"]), None)
+    counts: dict[str, int] = {}
+    for r in list(pkt_log.get(owner, ())):
+        if r.get("via") and time.time() - r["t"] < 24 * 3600:
+            counts[r["via"]] = counts.get(r["via"], 0) + 1
+    relays = [(k, node_name(i, k), v) for k, v in counts.items()]
+    with db_lock:
+        row = db.execute("SELECT chan FROM metric WHERE owner = ? AND chan IS NOT NULL ORDER BY t DESC LIMIT 1", (owner,)).fetchone()
+    return jsonify(issues=extras.mesh_issues(rows, me, relays=relays, chan=row[0] if row else None))
+
+
+@app.get("/api/coverage")
+def api_coverage():
+    """Звіт про покриття: у яких напрямках і наскільки далеко чути вузли (за координатами, що вони передають)."""
+    i = need()
+    try:
+        hours = min(max(int(request.args.get("hours", 168)), 1), 24 * 30)
+    except ValueError:
+        return err("hours: число")
+    rows = node_rows(i)
+    pos = my_position(i, rows)
+    if not pos:
+        return jsonify(center=None, report=None)
+    return jsonify(center={"lat": pos[0], "lon": pos[1]}, report=extras.coverage(pos[0], pos[1], [r for r in rows if not r["me"]], 12, window=hours * 3600))
+
+
+@app.get("/api/latest")
+def api_latest():
+    """Один рядок на вузол: останні показники пристрою й датчиків (з того, що вузли передали й панель запам'ятала)."""
+    i = need()
+    rows, env = node_rows(i), env_latest(all_nodes(i))
+    out = []
+    for r in rows:
+        e = env.get(r["id"])
+        out.append({"id": r["id"], "name": r["name"], "long": r["long"], "role": r["role"], "fav": r["fav"], "me": r["me"], "mqtt": r["mqtt"],
+                    "heard": r["heard"], "snr": r["snr"], "hops": r["hops"], "bat": r["bat"], "volt": r["volt"], "chan": r["chan_util"], "air": r["air_tx"],
+                    "uptime": r["uptime"], "alt": r["alt"], "aircraft": extras.aircraft(r["alt"], AIRCRAFT_M),
+                    "env": e[0] if e else None, "env_t": e[1] if e else None})
+    out.sort(key=lambda x: (not x["fav"], -(x["heard"] or 0)))
+    return jsonify(nodes=out, env_info={k: {"label": v[1], "unit": v[2]} for k, v in ENV_INFO.items()}, env_order=ENV_ORDER)
+
+
+@app.get("/api/messages/search")
+def api_messages_search():
+    """Повнотекстовий пошук у історії повідомлень вибраного вузла (без розрізнення регістру), найновіші першими."""
+    q = (request.args.get("q") or "").strip()
+    if not 2 <= len(q) <= 80:
+        return err("q: від 2 до 80 символів")
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 300)
+    except ValueError:
+        return err("limit: число")
+    with db_lock:
+        rows = db.execute(f"SELECT {MSG_COLS}, ack FROM msg WHERE owner = ? AND COALESCE(emoji, 0) = 0 AND casefold(text) LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                          (cur_id(), "%" + extras.like_escape(q.casefold()) + "%", limit)).fetchall()
+    return jsonify([{"t": t, "from": sd, "name": nm, "to": d, "ch": c, "text": x, "snr": snr, "out": bool(o), "pid": pid, "reply": rep, "emoji": bool(e), "ack": ack}
+                    for t, sd, nm, d, c, x, snr, o, pid, rep, e, ack in rows])
+
+
+# ---- геозони: вузол увійшов у коло / вийшов із нього -> подія (і сповіщення, якщо ввімкнено) ----
+GEO_FILE = os.environ.get("MESHPI_GEO_FILE", str(Path(DB_PATH).with_name("geofence.json")))
+geo_lock = threading.Lock()
+geo_state: dict[str, dict] = {}
+
+
+def geo_load():
+    try:
+        raw = json.loads(Path(GEO_FILE).read_text())
+    except (OSError, ValueError):
+        return extras.geo_defaults()
+    cfg, why = extras.geo_update(extras.geo_defaults(), raw if isinstance(raw, dict) else {})
+    return cfg if not why else extras.geo_defaults()
+
+
+geo_cfg = geo_load()
+
+
+def geo_tick(c, now=None):
+    i = c.iface
+    if i is None or not geo_cfg["on"] or not geo_cfg["zones"]:
+        return
+    rows = [r for r in node_rows(i) if not r["mqtt"]]
+    with geo_lock:
+        events = extras.geo_step(geo_cfg, geo_state.setdefault(c.id, {}), rows, now)
+    for kind, node, text in events:
+        add_event(c.id, kind, node, text, now)
+
+
+@app.get("/api/geofence")
+def api_geofence_get():
+    return jsonify(cfg=geo_cfg, max_zones=extras.GEO_MAX)
+
+
+@app.post("/api/geofence")
+def api_geofence_set():
+    global geo_cfg
+    new, why = extras.geo_update(geo_cfg, request.get_json(silent=True))
+    if why:
+        return err(why)
+    try:
+        write_private(GEO_FILE, json.dumps(new, ensure_ascii=False, indent=1))
+    except OSError as e:
+        return err(f"не вдалося записати налаштування: {e.strerror or e}", 500)
+    with geo_lock:
+        geo_cfg = new
+        geo_state.clear()   # нові зони: перше бачення вузла знову лише запам'ятовується
+    return api_geofence_get()
 
 
 def sampler():
@@ -2333,7 +2540,7 @@ def nodes():
             "env": e[0] if e else None, "env_t": e[1] if e else None,
             "mqtt": bool(n.get("viaMqtt")),  # вузол відомий через MQTT-міст, а не з радіоефіру
             "fav": bool(n.get("isFavorite")), "ignored": bool(n.get("isIgnored")), "muted": bool(n.get("isMuted")),
-            "role": u.get("role") or "CLIENT",
+            "role": u.get("role") or "CLIENT", "alt": p.get("altitude"), "aircraft": extras.aircraft(p.get("altitude"), AIRCRAFT_M),
         })
     out.sort(key=lambda x: x["heard"] or 0, reverse=True)
     return unchanged_304(jsonify(out))

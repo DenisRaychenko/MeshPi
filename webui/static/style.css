@@ -181,6 +181,7 @@
   .evk {display:inline-block; font-family:var(--font-mono); font-size:0.7rem; padding:2px 9px; border-radius:999px; border:1px solid var(--line); color:var(--text-hi); white-space:nowrap;}
   .evk.new {color:var(--signal); border-color:var(--signal-dim);}
   .evk.fav_off {color:var(--crit); border-color:var(--crit-border);}
+  .evk.geo_in, .evk.geo_out {color:var(--signal); border-color:var(--signal-dim);}
   .evk.fav_on {color:var(--warn); border-color:var(--warn);}
   .evk.bat_low, .evk.chan_high, .evk.reboot {color:var(--warn); border-color:var(--warn);}
   .evk.link_lost {color:var(--crit); border-color:var(--crit-border);}

@@ -36,13 +36,17 @@ def pos(dkm, bearing):
             "longitude": LON + dkm * math.sin(bearing) / (111.0 * math.cos(math.radians(LAT)))}
 
 
-def node(num, name, short, hops, dkm=None, brg=0.0, role=None, snr=None, mqtt=False, heard=60, env=None):
+def node(num, name, short, hops, dkm=None, brg=0.0, role=None, snr=None, mqtt=False, heard=60, env=None, alt=None, dev=None):
     n = {"num": num, "user": {"id": f"!{num:08x}", "longName": name, "shortName": short, "hwModel": "RAK4631"},
          "hopsAway": hops, "viaMqtt": mqtt, "lastHeard": now - heard, "snr": snr, "environmentMetrics": env or {}}
     if role:
         n["user"]["role"] = role
     if dkm is not None:
         n["position"] = pos(dkm, brg)
+        if alt is not None:
+            n["position"]["altitude"] = alt
+    if dev:
+        n["deviceMetrics"] = dev
     return n
 
 
@@ -62,7 +66,12 @@ NODES = [
     node(0x200C, "Знахідка", "FIND", 4, 12.0, 1.0, "LOST_AND_FOUND", -12.0, heard=14000),
     node(0x200D, "Гість з MQTT", "MQTT", 2, 7.0, 3.0, "CLIENT", None, mqtt=True, heard=4000),
     node(0x200E, "Сусід-клієнт", "SUSD", 1, 1.4, 4.9, "CLIENT", 6.5, heard=120),
+    node(0x200F, "Літак (борт)", "PLAN", 2, 14.0, 1.9, "CLIENT", -4.0, heard=200, alt=9400),
 ]
+NODES[1]["deviceMetrics"] = {"batteryLevel": 101, "voltage": 5.0, "channelUtilization": 9.0, "airUtilTx": 12.4, "uptimeSeconds": 900000}
+NODES[5]["deviceMetrics"] = {"batteryLevel": 12, "voltage": 3.5, "channelUtilization": 3.0, "airUtilTx": 0.6, "uptimeSeconds": 41000}
+NODES[2]["isFavorite"] = True
+NODES[3]["deviceMetrics"] = {"batteryLevel": 64, "voltage": 3.9, "channelUtilization": 4.0, "airUtilTx": 0.8, "uptimeSeconds": 240}
 import base64  # noqa: E402
 for _n in NODES:   # вигадані публічні ключі: у вузлів 0x2007 і 0x2009 однакові (як клони), решта різні
     _seed = 0x2007 if _n["num"] == 0x2009 else _n["num"]
@@ -284,7 +293,11 @@ m.notify_cfg["telegram"].update(on=True, token="123456789:" + "A" * 35, chat="-1
 m.notify_cfg["kinds"]["new"] = True
 m.auto_cfg["reply"].update(on=True, scope="dm")
 m.auto_cfg["reply"]["rules"] = [{"word": "info", "text": "Meshpi: почув вас за {hops} стрибків, SNR {snr}. Вузлів за годину: {nodes}."},
-                                {"word": "погода", "text": "База: {temp} °C, {hum}%, {press} гПа, заряд {bat}"}]
+                                {"word": "погода", "text": "База: {temp} °C, {hum}%, {press} гПа, заряд {bat}"},
+                                {"word": r"^(test|ping|тест)", "regex": True, "kind": "text", "target": "", "text": "Чую вас напряму, SNR {snr}", "text_far": "Чую за {hops} стрибків через {last_hop}, SNR {snr}"}]
+m.auto_cfg["reply"]["jitter"] = 20
+m.geo_cfg = {"on": True, "zones": [{"id": 1, "name": "Садиба", "lat": LAT, "lon": LON, "radius_m": 800.0, "enter": True, "exit": True, "who": "all"},
+                                   {"id": 2, "name": "Пагорб", "lat": LAT + 1.8 * math.cos(0.6) / 111.0, "lon": LON + 1.8 * math.sin(0.6) / (111.0 * math.cos(math.radians(LAT))), "radius_m": 300.0, "enter": True, "exit": False, "who": "fav"}]}
 m.auto_cfg["announce"].update(on=True, items=[{"id": 1, "text": "CQ від Демо-бази: мережа працює, відповідаємо на «info»", "every": 360, "ch": 0, "quiet_from": 23, "quiet_to": 6}])
 m.SOLAR_FILE = os.path.join(tmp, "solar.json")
 open(m.SOLAR_FILE, "w").write(json.dumps({"main": {"on": True, "lat": LAT, "lon": LON, "dec": 35, "az": 0, "kwp": 0.1, "cap_wh": 24.0, "load_w": 0.45, "eff": 0.75}}))

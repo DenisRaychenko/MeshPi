@@ -67,7 +67,7 @@ check("an announcement every <60 min is refused", bad({"announce": {"items": [{"
 check("duplicate ids are refused", bad({"announce": {"items": [{"id": 1, "text": "x"}, {"id": 1, "text": "y"}]}}))
 check("floats, strings and booleans are not accepted as numbers", bad({"reply": {"cooldown": 60.5}}) and bad({"reply": {"cooldown": "300"}}) and bad({"reply": {"per_hour": True}}))
 n, w = x.auto_update(D, {"reply": {"on": True, "rules": [{"word": "Погода", "text": "{temp}°C"}]}, "announce": {"items": [{"text": "Привіт з Meshpi", "every": 120, "ch": 1}]}})
-check("a valid update lowers the word's case and keeps the rest", w is None and n["reply"]["rules"] == [{"word": "погода", "text": "{temp}°C"}] and n["announce"]["items"][0]["every"] == 120 and D["reply"]["rules"][0]["word"] == "info")
+check("a valid update lowers the word's case and keeps the rest", w is None and [(r["word"], r["text"], r["kind"]) for r in n["reply"]["rules"]] == [("погода", "{temp}°C", "text")] and n["announce"]["items"][0]["every"] == 120 and D["reply"]["rules"][0]["word"] == "info")
 
 # ---- заплановані оголошення ----
 A = x.auto_update(D, {"announce": {"on": True, "items": [{"id": 1, "text": "CQ з {nodes} вузлів", "every": 60, "ch": 0, "quiet_from": 23, "quiet_to": 6}]}})[0]
@@ -169,4 +169,53 @@ m.auto_state["ann"]["1"] = 0
 m.auto_tick(conn, time.time() + 9000)
 check("offline: nothing is sent", len(fi.sent) == n0 + 1)
 check("the page has the automation section and script", "autobox" in c.get("/").get_data(as_text=True) and c.get("/static/auto.js").status_code == 200)
+
+# ---- розширені правила: регулярний вираз, окремий текст для далеких, {last_hop}, HTTP і скрипт ----
+def with_rules(*rules, **kw):
+    c, why = x.auto_update(D, {"reply": {"on": True, "rules": list(rules), **kw}})
+    return c, why
+
+c, why = with_rules({"word": r"^(test|ping)\b", "regex": True, "text": "near {hops}", "text_far": "far {hops} via {last_hop}"})
+check("a regex rule is accepted", why is None, str(why))
+m_near = {**MSG, "text": "Test please", "hops": 0, "via_name": "Alpha"}
+m_far = {**MSG, "text": "ping", "hops": 2, "via_name": "Relay"}
+check("regex matches anywhere the pattern says (case-insensitive) and uses the direct text", x.auto_reply(c, {}, m_near, CTX, T)[0] == "[авто] near 0", str(x.auto_reply(c, {}, m_near, CTX, T)))
+check("a multi-hop message gets the far template with {last_hop}", x.auto_reply(c, {}, m_far, CTX, T)[0] == "[авто] far 2 via Relay")
+check("a rule without a far text uses the ordinary one at any distance", x.auto_reply(cfg(), {}, {**MSG, "hops": 3}, CTX, T)[0].startswith("[авто] Meshpi"))
+check("an unrelated text matches no regex rule", x.auto_reply(c, {}, {**MSG, "text": "hello"}, CTX, T)[1] == "немає правила")
+for bad_re in ("(a+)+$", "[", "x" * 61, ""):
+    check(f"regex {bad_re[:12]!r} is refused", with_rules({"word": bad_re, "regex": True, "text": "t"})[1])
+check("the word of a plain rule must still be a word", with_rules({"word": "two words", "text": "t"})[1])
+check("jitter is limited to 0..120 s", with_rules({"word": "a", "text": "t"}, jitter=121)[1] and with_rules({"word": "a", "text": "t"}, jitter=30)[1] is None)
+
+c, why = with_rules({"word": "weather", "kind": "http", "target": "http://svc.test/w?q={name}", "text": "no data"},
+                    {"word": "run", "kind": "script", "target": "hello.py"})
+check("http and script rules are accepted", why is None, str(why))
+job, w = x.auto_reply(c, {}, {**MSG, "text": "weather", "sender_name": "A B&C"}, CTX, T)
+check("an http rule becomes a job (nothing is run inside the lock), and the budget is spent", isinstance(job, x.Job) and w == "ok")
+check("url tokens are percent-encoded", x.auto_render("http://s/?q={name}", {"name": "A B&C"}, enc=lambda v: __import__("urllib.parse").parse.quote(v, safe="")) == "http://s/?q=A%20B%26C")
+check("job text: plain text gets the bot prefix", x.job_text(job, "  21 °C\nясно ") == "[авто] 21 °C ясно")
+check("job text: JSON response is unwrapped", x.job_text(job, '{"response": "ok!"}') == "[авто] ok!")
+check("job text: an empty answer falls back to the rule text, and with no fallback to nothing", x.job_text(job, "") == "[авто] no data"
+      and x.job_text(x.Job({"text": ""}, {}, {}), "") is None)
+check("job text never exceeds the reply limit", len(x.job_text(job, "я" * 500).encode()) <= len("[авто] ".encode()) + x.AUTO_TEXT_BYTES)
+for bad_rule in ({"word": "a", "kind": "http", "target": "ftp://x"}, {"word": "a", "kind": "http", "target": "http://x y"},
+                 {"word": "a", "kind": "script", "target": "../x.py"}, {"word": "a", "kind": "script", "target": "a/b.sh"},
+                 {"word": "a", "kind": "script", "target": "x.exe"}, {"word": "a", "kind": "cmd", "target": "ls"}):
+    check(f"rule {bad_rule['kind']}:{bad_rule['target']} is refused", with_rules(bad_rule)[1])
+
+# скрипт справді запускається тільки з каталогу scripts, без шляху й без змінних середовища панелі
+sd = os.path.join(tmp, "scripts"); os.makedirs(sd)
+open(os.path.join(sd, "hello.py"), "w").write("import os, sys\nprint(os.environ.get('MESSAGE', '') + '|' + str(os.environ.get('MESHPI_DB')) + '|' + os.environ.get('NODE_ID', ''))\n")
+open(os.path.join(sd, "slow.sh"), "w").write("sleep 5\n")
+m.SCRIPTS_DIR = type(m.SCRIPTS_DIR)(sd)
+m.SCRIPT_TIMEOUT = 1
+rule = {"word": "run", "kind": "script", "target": "hello.py", "text": ""}
+out = m.run_job(x.Job(rule, {}, {"text": "run it", "sender": "!000000aa", "sender_name": "A"}), {}, None)
+check("a script gets the message in the environment and none of the panel's secrets", out.strip() == "run it|None|!000000aa", str(out))
+check("scripts are listed by name", m.script_files() == ["hello.py", "slow.sh"], str(m.script_files()))
+check("a script that runs too long is killed and gives no answer", m.run_job(x.Job({**rule, "target": "slow.sh"}, {}, {"text": "x"}), {}, None) is None)
+check("a path outside the scripts folder is never run", m.run_job(x.Job({**rule, "target": "../hello.py"}, {}, {"text": "x"}), {}, None) is None)
+check("a missing script gives no answer", m.run_job(x.Job({**rule, "target": "none.py"}, {}, {"text": "x"}), {}, None) is None)
+
 sys.exit(0 if ok else 1)

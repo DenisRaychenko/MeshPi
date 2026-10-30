@@ -13,9 +13,20 @@
 
   function ruleRow(r) {
     const row = el('div', 'row'); row.style.marginBottom = '6px';
-    const w = txt(r.word, '8em', 'слово'), t = txt(r.text, '34em', 'текст відповіді, до ' + st.limits.text_bytes + ' байт');
+    const w = txt(r.word, '9em', 'слово'), t = txt(r.text, '24em', 'текст відповіді, до ' + st.limits.text_bytes + ' байт');
+    const far = txt(r.text_far, '18em', 'інший текст, якщо далі 0 стрибків');
+    const rx = el('input'); rx.type = 'checkbox'; rx.checked = !!r.regex; rx.title = 'регулярний вираз замість слова на початку повідомлення';
+    const kind = el('select', 'tg-input'); for (const [v, n] of [['text', 'текст'], ['http', 'HTTP GET'], ['script', 'скрипт']]) kind.append(new Option(n, v)); kind.value = r.kind || 'text';
+    const target = el('select', 'tg-input'); target.hidden = true;
+    const url = txt(r.kind === 'http' ? r.target : '', '20em', 'http://…/?q={name}'); url.hidden = true;
+    for (const f of st.scripts) target.append(new Option(f, f)); if (r.kind === 'script') target.value = r.target;
+    const sync = () => { url.hidden = kind.value !== 'http'; target.hidden = kind.value !== 'script' || !st.scripts.length; };
+    kind.onchange = sync; sync();
     const del = el('button', 'check-btn', '✕'); del.type = 'button'; del.onclick = () => row.remove();
-    row.append(w, t, del); row._get = () => ({word: w.value, text: t.value }); return row;
+    const lr = el('label'); lr.append(rx, ' regex');
+    row.append(w, lr, kind, url, target, t, far, del);
+    row._get = () => ({word: w.value, text: t.value, text_far: far.value, regex: rx.checked, kind: kind.value, target: kind.value === 'http' ? url.value : target.value});
+    return row;
   }
   function itemRow(it, id) {
     const row = el('div', 'row'); row.style.marginBottom = '6px';
@@ -34,12 +45,12 @@
     R.on = el('input'); R.on.type = 'checkbox'; R.on.checked = c.reply.on;
     const on = el('label'); on.append(R.on, ' ввімкнено'); on.style.fontWeight = '600';
     R.scope = el('select', 'tg-input'); for (const [v, t] of [['dm', 'лише особисті'], ['channel', 'лише канал'], ['both', 'і особисті, і канал']]) R.scope.append(new Option(t, v)); R.scope.value = c.reply.scope;
-    R.cooldown = num(c.reply.cooldown, '6em', 60, 86400); R.per_hour = num(c.reply.per_hour, '4em', 1, 30); R.cut = num(c.reply.chan_cutoff, '4em', 0, 100);
+    R.cooldown = num(c.reply.cooldown, '6em', 60, 86400); R.per_hour = num(c.reply.per_hour, '4em', 1, 30); R.cut = num(c.reply.chan_cutoff, '4em', 0, 100); R.jitter = num(c.reply.jitter, '4em', 0, 120);
     const opts = el('div', 'row'); opts.style.margin = '6px 0';
-    opts.append(lab('відповідати', R.scope), lab('пауза для одного вузла, с', R.cooldown), lab('не більше на годину', R.per_hour), lab('не передавати при зайнятості ефіру, % (0 вимкнено)', R.cut));
+    opts.append(lab('відповідати', R.scope), lab('пауза для одного вузла, с', R.cooldown), lab('не більше на годину', R.per_hour), lab('не передавати при зайнятості ефіру, % (0 вимкнено)', R.cut), lab('випадкова пауза в каналі, с (0 вимкнено)', R.jitter));
     const rules = el('div'); R.rules = rules; for (const r of c.reply.rules) rules.append(ruleRow(r));
-    const add = el('button', 'check-btn', '＋ правило'); add.type = 'button'; add.onclick = () => { if (rules.children.length < 10) rules.append(ruleRow({word: '', text: ''})); };
-    const hint = el('p', 'hint', 'Підстановки: ' + st.placeholders.map(p => '{' + p + '}').join(' ') + '. Слово береться з початку повідомлення (регістр неважливий).');
+    const add = el('button', 'check-btn', '＋ правило'); add.type = 'button'; add.onclick = () => { if (rules.children.length < 10) rules.append(ruleRow({word: '', text: '', kind: 'text'})); };
+    const hint = el('p', 'hint', 'Підстановки: ' + st.placeholders.map(p => '{' + p + '}').join(' ') + '. Слово береться з початку повідомлення (регістр неважливий); з позначкою regex шукається вираз у перших 200 символах. «HTTP GET» і «скрипт» беруть відповідь ззовні: скрипти лежать у data/scripts на сервері й шляхів не приймають (див. документацію).');
     form.append(h1, on, opts, rules, add, hint);
 
     const h2 = el('h3', null, 'Заплановані оголошення'); h2.style.cssText = 'margin:14px 0 6px;font-size:.9rem';
@@ -55,7 +66,7 @@
   }
 
   const body = () => ({
-    reply: {on: R.on.checked, scope: R.scope.value, cooldown: +R.cooldown.value, per_hour: +R.per_hour.value, chan_cutoff: +R.cut.value, rules: [...R.rules.children].map(r => r._get())},
+    reply: {on: R.on.checked, scope: R.scope.value, cooldown: +R.cooldown.value, per_hour: +R.per_hour.value, chan_cutoff: +R.cut.value, jitter: +R.jitter.value, rules: [...R.rules.children].map(r => r._get())},
     announce: {on: A.on.checked, chan_cutoff: +A.cut.value, items: [...A.items.children].map(r => r._get())},
   });
   $('autosave').onclick = async () => {

@@ -66,6 +66,8 @@
       <button type="button" id="forget" class="check-btn" hidden title="Видалити розмову й усю її історію на платі">🗑 Видалити розмову</button>
       <label title="Звук і сповіщення про нові повідомлення, поки вкладка відкрита"><input type="checkbox" id="notify"> 🔔 сповіщати</label>
     </div>
+    <div class="row" style="margin-bottom:8px"><input class="tg-input" id="msgq" type="search" placeholder="Пошук у всій історії повідомлень" autocomplete="off" aria-label="Пошук у повідомленнях" style="min-width:16em"></div>
+    <div id="msgres" hidden style="margin-bottom:10px;max-height:260px;overflow-y:auto"></div>
     <div id="log"></div>
     <div id="replybar" class="replybar" hidden><span></span><button type="button" class="react-btn" title="Скасувати відповідь (Esc)">✕</button></div>
     <form id="send" class="row">
@@ -107,6 +109,15 @@
       <pre id="ndout" style="white-space:pre-wrap;margin:0"></pre>
       <p class="hint" style="margin-top:8px">Кожен запит — передача в ефір; відповідь може йти до хвилини, повтор — не частіше ніж раз на 30 с.</p>
     </div>
+  </section>
+<section class="panel" id="latestbox">
+    <h2>Останні показники</h2>
+    <p class="evnote">Один рядок на вузол: те, що він сам передав у телеметрії (заряд, напруга, ефір, час роботи) і датчики довкілля. ✈ означає вузол на великій висоті, ймовірно літак чи дрон.</p>
+    <div class="row" style="margin-bottom:8px"><input class="tg-input" id="latestq" placeholder="Пошук за назвою або ID" autocomplete="off"><label><input type="checkbox" id="latestfav"> лише обрані ★ і ви</label><span id="latestcount" class="hint"></span></div>
+    <div class="table-wrap"><table>
+      <thead><tr id="latesthead"><th>Вузол</th><th>Роль</th><th>Заряд</th><th>Напруга</th><th>Канал</th><th>Ефір TX</th><th>Працює</th><th>Темп.</th><th>Волог.</th><th>Тиск</th><th>SNR</th><th>Стрибки</th><th>Чутно</th></tr></thead>
+      <tbody id="latestrows"></tbody>
+    </table></div>
   </section>
 <section id="mapbox" class="panel" hidden>
     <h2>Карта (плитки — OpenStreetMap, потрібен інтернет у браузері)</h2>
@@ -267,6 +278,18 @@
     <div class="row" style="margin-bottom:8px"><label>за <select class="tg-input" id="healthhours"><option value="6">6 год</option><option value="24" selected>24 год</option><option value="168">7 діб</option></select></label><span id="healthnote" class="hint"></span></div>
     <div id="healthfind"></div>
     <div class="chartgrid" id="healthcharts"></div>
+</section>
+<section class="panel" id="issuebox">
+    <h2>Проблеми мережі</h2>
+    <p class="evnote">Підказки зі списку вузлів і журналу пакетів: хто надто довго передає, слабкі прямі лінки, ретранслятор, на якому тримається все, схожі назви, хибні координати. Лише читання; це евристики, а не вердикт.</p>
+    <div class="row" style="margin-bottom:8px"><button type="button" id="issuerun" class="check-btn">↻ Оновити</button><span id="issuenote" class="hint"></span></div>
+    <div id="issuefind"></div>
+</section>
+<section class="panel" id="covpanel">
+    <h2>Покриття</h2>
+    <p class="evnote">У яких напрямках і наскільки далеко чути вузли, за координатами, які вони передають. Показує сліпі сектори й ваш реальний радіус.</p>
+    <div class="row" style="margin-bottom:8px"><label>вузли, почуті за <select class="tg-input" id="covhours"><option value="24">24 год</option><option value="168" selected>7 діб</option><option value="720">30 діб</option></select></label><span id="covnote" class="hint"></span></div>
+    <div id="covbox"></div>
 </section>
   </div>
   <div class="tabpane" data-tab="admin" role="tabpanel" hidden>
@@ -489,6 +512,12 @@
     <div id="autoform"></div>
     <div class="row" style="margin-top:10px"><button type="button" id="autosave" class="check-btn">💾 Зберегти</button><span id="automsg" class="hint"></span></div>
 </section>
+<section class="panel" id="geobox">
+    <h2>Геозони</h2>
+    <p class="evnote">Коли вузол (за позицією, яку він передає) входить у коло чи виходить із нього, панель записує подію й, якщо ввімкнено, надсилає сповіщення (див. «Сповіщення поза браузером»). Лише читання, в ефір нічого не йде. Позиції старші за 3 год не враховуються, межа має запас 10% проти мерехтіння.</p>
+    <div id="geoform"></div>
+    <div class="row" style="margin-top:10px"><button type="button" id="geosave" class="check-btn">💾 Зберегти</button><span id="geomsg" class="hint"></span></div>
+</section>
 <section class="panel" id="secbox">
     <h2>Перевірка безпеки</h2>
     <p class="evnote">Лише читання: повтори публічних ключів серед вузлів, ключ каналу за замовчуванням, вихід у MQTT, адміністрування через канал. Секретні ключі панель не читає й не показує.</p>
@@ -665,9 +694,9 @@ function renderNodes() {
     const pos = n.lat != null && n.lon != null ? `${n.lat.toFixed(4)}, ${n.lon.toFixed(4)}` : '—';
     star.dataset.l = '★';
     COLS.forEach((l, k) => {
-      const c = tr.insertCell(), v = [n.long || n.short, n.id, n.snr, n.rssi, n.hops, pos, envStr(n), distStr(n.dist), n.mqtt ? 'так' : 'ні', ago(n.heard)][k];
+      const c = tr.insertCell(), v = [(n.aircraft ? '✈ ' : '') + (n.long || n.short || ''), n.id, n.snr, n.rssi, n.hops, pos, envStr(n), distStr(n.dist), n.mqtt ? 'так' : 'ні', ago(n.heard)][k];
       c.textContent = v ?? '—'; c.dataset.l = l;
-      if (k === 0 && n.id) { c.title = 'Написати цьому вузлу'; c.onclick = () => openConv(n.id); }
+      if (k === 0 && n.id) { c.title = n.aircraft ? `Висота ${Math.round(n.alt)} м: ймовірно літак чи дрон. Написати цьому вузлу` : 'Написати цьому вузлу'; c.onclick = () => openConv(n.id); }
       if (k === 1 && n.id) { c.title = 'Подробиці й запити до вузла'; c.onclick = () => openNode(n); }
       if (k === 6 && n.env_t) c.title = 'Показники ' + ago(n.env_t) + ' тому';
       if (k === 8) { c.title = 'Over MQTT: ' + (n.mqtt ? 'так, вузол почуто через MQTT-міст' : 'ні, почуто з радіоефіру'); if (n.mqtt) c.style.color = 'var(--warn)'; }
@@ -1263,6 +1292,7 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/notify.js"></script>
 <script src="/static/security.js"></script>
 <script src="/static/auto.js"></script>
+<script src="/static/insights.js"></script>
 <script src="/static/access.js"></script>
 <script src="/static/role.js"></script>
 <script src="/static/nodecharts.js"></script>

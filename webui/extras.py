@@ -5,6 +5,7 @@ import base64
 import binascii
 import csv
 import io
+import json
 import math
 import re
 import time
@@ -409,12 +410,24 @@ def range_csv(rows, names=None):
 BOT_PREFIX = "[авто] "
 AUTO_MAX_RULES, AUTO_MAX_ITEMS, AUTO_TEXT_BYTES = 10, 5, 120
 WORD_RE = re.compile(r"^[\w.-]{1,20}$", re.U)
-PLACEHOLDERS = ("name", "hops", "snr", "rssi", "nodes", "bat", "time", "temp", "hum", "press")
+PLACEHOLDERS = ("name", "hops", "snr", "rssi", "nodes", "bat", "time", "temp", "hum", "press", "last_hop")
+RULE_KINDS = ("text", "http", "script")
+SCRIPT_RE = re.compile(r"^[\w.-]{1,60}\.(py|sh)$")   # лише ім'я файлу з data/scripts, без шляху
+REGEX_MAX = 60
+NESTED_Q = re.compile(r"\([^)]*[+*][^)]*\)[+*{]")     # (a+)+ тощо: катастрофічний перебір; такі шаблони не приймаємо
+
+
+class Job:
+    """Правило з HTTP чи скриптом: відповідь отримують поза замком (мережа, процес), тому auto_reply лише видає завдання."""
+    def __init__(self, rule, values, msg):
+        self.rule, self.values, self.msg = rule, values, msg
 
 
 def auto_defaults():
     return {"reply": {"on": False, "scope": "dm", "cooldown": 300, "per_hour": 6, "chan_cutoff": 25,
-                      "rules": [{"word": "info", "text": "Meshpi: почув вас за {hops} стрибків, SNR {snr}. Вузлів за годину: {nodes}."}]},
+                      "jitter": 0,
+                      "rules": [{"word": "info", "text": "Meshpi: почув вас за {hops} стрибків, SNR {snr}. Вузлів за годину: {nodes}.",
+                                 "regex": False, "text_far": "", "kind": "text", "target": ""}]},
             "announce": {"on": False, "chan_cutoff": 25, "items": []}}
 
 
@@ -422,6 +435,40 @@ def _int(v, lo, hi):
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v) or not lo <= v <= hi:
         raise ValueError
     return int(v)
+
+
+def check_rule(x):
+    """Одне правило автовідповідача з тіла запиту -> очищений словник чи ValueError."""
+    x = x or {}
+    kind = str(x.get("kind") or "text")
+    if kind not in RULE_KINDS:
+        raise ValueError("вид правила: text | http | script")
+    regex = bool(x.get("regex"))
+    word = str(x.get("word", "")).strip()
+    if regex:
+        if not word or len(word) > REGEX_MAX or NESTED_Q.search(word):
+            raise ValueError(f"регулярний вираз: до {REGEX_MAX} символів, без вкладених повторів")
+        try:
+            re.compile(word)
+        except re.error:
+            raise ValueError("некоректний регулярний вираз") from None
+    else:
+        word = word.casefold()
+        if not WORD_RE.match(word):
+            raise ValueError("слово-тригер: 1–20 символів без пробілів")
+    text = str(x.get("text", "")).strip()
+    far = str(x.get("text_far") or "").strip()
+    target = str(x.get("target") or "").strip()
+    for t in (text, far):
+        if len(t.encode("utf-8")) > AUTO_TEXT_BYTES:
+            raise ValueError(f"текст відповіді: до {AUTO_TEXT_BYTES} байт")
+    if kind == "text" and not text:
+        raise ValueError(f"текст відповіді: до {AUTO_TEXT_BYTES} байт")
+    if kind == "http" and not re.match(r"^https?://[^\s]{3,300}$", target):
+        raise ValueError("HTTP: адреса має починатися з http:// чи https://")
+    if kind == "script" and not SCRIPT_RE.match(target):
+        raise ValueError("скрипт: ім'я файлу .py чи .sh з каталогу data/scripts")
+    return {"word": word, "text": text, "regex": regex, "text_far": far, "kind": kind, "target": target if kind != "text" else ""}
 
 
 def auto_update(cfg, body):
@@ -448,15 +495,13 @@ def auto_update(cfg, body):
                     raise ValueError(f"правил не більше {AUTO_MAX_RULES}")
                 rules = []
                 for x in r["rules"]:
-                    word, text = str((x or {}).get("word", "")).strip().casefold(), str((x or {}).get("text", "")).strip()
-                    if not WORD_RE.match(word):
-                        raise ValueError("слово-тригер: 1–20 символів без пробілів")
-                    if not text or len(text.encode("utf-8")) > AUTO_TEXT_BYTES:
-                        raise ValueError(f"текст відповіді: до {AUTO_TEXT_BYTES} байт")
-                    if word in [y["word"] for y in rules]:
-                        raise ValueError(f"слово «{word}» повторюється")
-                    rules.append({"word": word, "text": text})
+                    rule = check_rule(x)
+                    if rule["word"] in [y["word"] for y in rules]:
+                        raise ValueError(f"слово «{rule['word']}» повторюється")
+                    rules.append(rule)
                 new["reply"]["rules"] = rules
+            if "jitter" in r:
+                new["reply"]["jitter"] = _int(r["jitter"], 0, 120)
         a = body.get("announce") if isinstance(body, dict) else None
         if isinstance(a, dict):
             if "on" in a:
@@ -485,13 +530,15 @@ def auto_update(cfg, body):
     return new, None
 
 
-def auto_render(template, ctx):
-    """Підставити {name}, {hops}… Лише відомі підстановки; невідомі лишаються як є, нічого не виконується."""
+def auto_render(template, ctx, enc=None):
+    """Підставити {name}, {hops}… Лише відомі підстановки; невідомі лишаються як є, нічого не виконується.
+    enc: функція екранування значень (для адрес HTTP)."""
     def sub(m):
         if m.group(1) not in PLACEHOLDERS:
             return m.group(0)
         v = ctx.get(m.group(1))
-        return "?" if v is None else str(v)
+        v = "?" if v is None else str(v)
+        return enc(v) if enc else v
     out = re.sub(r"\{(\w+)\}", sub, template)
     while len(out.encode("utf-8")) > 200:       # ліміт Meshtastic; підстановки не мають його перевищити
         out = out[:-1]
@@ -521,8 +568,7 @@ def auto_reply(cfg, state, msg, ctx, now=None):
         return None, "повідомлення застаріло"
     if not (r["scope"] == "both" or (r["scope"] == "dm" and msg.get("dm")) or (r["scope"] == "channel" and not msg.get("dm"))):
         return None, "інша область"
-    word = (msg["text"].strip().split() or [""])[0].strip("!/.,?").casefold()
-    rule = next((x for x in r["rules"] if x["word"] == word), None)
+    rule = match_rule(r["rules"], msg["text"])
     if not rule:
         return None, "немає правила"
     if now - state.setdefault("last", {}).get(msg["sender"], 0) < r["cooldown"]:
@@ -536,8 +582,47 @@ def auto_reply(cfg, state, msg, ctx, now=None):
     if len(state["last"]) > 500:
         state["last"] = {k: v for k, v in state["last"].items() if now - v < 86400}
     values = {"name": msg.get("sender_name"), "hops": msg.get("hops"), "snr": None if msg.get("snr") is None else f"{msg['snr']:.0f}",
-              "rssi": msg.get("rssi"), **{k: ctx.get(k) for k in ("nodes", "bat", "time", "temp", "hum", "press")}}
-    return BOT_PREFIX + auto_render(rule["text"], values), "ok"
+              "rssi": msg.get("rssi"), "last_hop": msg.get("via_name"), **{k: ctx.get(k) for k in ("nodes", "bat", "time", "temp", "hum", "press")}}
+    if rule.get("kind", "text") != "text":
+        return Job(rule, values, msg), "ok"
+    far = rule.get("text_far") if (msg.get("hops") or 0) > 0 else ""
+    return BOT_PREFIX + auto_render(far or rule["text"], values), "ok"
+
+
+def match_rule(rules, text):
+    """Перше правило, що підходить: слово на початку повідомлення (без регістру й розділових знаків) чи регулярний вираз
+    будь-де в перших 200 символах."""
+    word = (text.strip().split() or [""])[0].strip("!/.,?").casefold()
+    for x in rules:
+        if x.get("regex"):
+            try:
+                if re.search(x["word"], text[:200], re.I):
+                    return x
+            except re.error:
+                continue
+        elif x["word"] == word:
+            return x
+    return None
+
+
+def job_text(job, out):
+    """Результат HTTP чи скрипта -> текст відповіді (JSON {"response": ...} чи просто текст) або None, коли відповіді немає."""
+    out = (out or "").strip()
+    if out.startswith("{"):
+        try:
+            d = json.loads(out)
+            out = str(d.get("response") or "") if isinstance(d, dict) else out
+        except ValueError:
+            pass
+    out = " ".join(out.split())
+    if not out:
+        out = (job.rule.get("text") or "").strip()
+        out = auto_render(out, job.values) if out else ""
+    if not out:
+        return None
+    while len(out.encode("utf-8")) > AUTO_TEXT_BYTES:
+        out = out[:-1]
+    return BOT_PREFIX + out
 
 
 def in_quiet(h, qf, qt):
@@ -736,3 +821,199 @@ def view_graph(links, center):
             flow = "up" if db_ < da else "down"
         out.append({**l, "flow": flow})
     return out, dist
+
+
+# ---- геозони: вузол увійшов у коло чи вийшов із нього ------------------------------------------------------------------------
+GEO_MAX, GEO_HYST = 10, 1.1       # зон не більше; вихід зараховуємо за 1.1 радіуса, щоб вузол на межі не «мерехтів»
+GEO_FRESH = 3 * 3600              # с: позиції старіші за це не рахуємо (вузол міг давно поїхати)
+
+
+def geo_defaults():
+    return {"on": False, "zones": []}
+
+
+def geo_update(cfg, body):
+    """-> (нові налаштування, помилка). Усі межі перевіряються тут."""
+    import copy
+    new = copy.deepcopy(cfg)
+    try:
+        if not isinstance(body, dict):
+            raise ValueError("очікується JSON")
+        if "on" in body:
+            new["on"] = bool(body["on"])
+        if "zones" in body:
+            zs = body["zones"]
+            if not isinstance(zs, list) or len(zs) > GEO_MAX:
+                raise ValueError(f"зон не більше {GEO_MAX}")
+            out = []
+            for k, z in enumerate(zs):
+                z = z or {}
+                name = str(z.get("name", "")).strip()
+                if not 1 <= len(name) <= 30:
+                    raise ValueError("назва зони: 1–30 символів")
+                lat, lon, rad = z.get("lat"), z.get("lon"), z.get("radius_m")
+                if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (lat, lon, rad)):
+                    raise ValueError("широта, довгота й радіус мають бути числами")
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0) or not 50 <= rad <= 200000:
+                    raise ValueError("широта −90…90, довгота −180…180, радіус 50…200000 м")
+                who = z.get("who", "all")
+                if who not in ("all", "fav"):
+                    raise ValueError("who: all | fav")
+                out.append({"id": _int(z.get("id", k + 1), 1, 999), "name": name, "lat": float(lat), "lon": float(lon), "radius_m": float(rad),
+                            "enter": bool(z.get("enter", True)), "exit": bool(z.get("exit", True)), "who": who})
+            if len({z["id"] for z in out}) != len(out):
+                raise ValueError("id зон мають бути різними")
+            new["zones"] = out
+    except ValueError as e:
+        return cfg, (str(e) or "некоректне значення")
+    return new, None
+
+
+def geo_step(cfg, state, nodes, now=None):
+    """Один крок: nodes = [{id, name, lat, lon, fav, heard}]. state: {"зона|вузол": True/False} (всередині чи ні), змінюється тут.
+    Перше бачення вузла лише запам'ятовується (щоб при запуску не було потоку подій). -> [(kind, вузол, текст)]."""
+    now = now or time.time()
+    if not cfg.get("on"):
+        return []
+    out = []
+    for z in cfg["zones"]:
+        for n in nodes:
+            lat, lon = n.get("lat"), n.get("lon")
+            if lat is None or lon is None or (lat == 0 and lon == 0) or now - (n.get("heard") or 0) > GEO_FRESH:
+                continue
+            if z["who"] == "fav" and not n.get("fav"):
+                continue
+            d = haversine_km(z["lat"], z["lon"], lat, lon) * 1000
+            key = f"{z['id']}|{n['id']}"
+            was = state.get(key)
+            inside = d <= z["radius_m"] if not was else d <= z["radius_m"] * GEO_HYST
+            state[key] = inside
+            if was is None or was == inside:
+                continue
+            if inside and z["enter"]:
+                out.append(("geo_in", n["id"], f"📍 {n['name']} увійшов у зону «{z['name']}» (≈{d:.0f} м від центра)"))
+            elif not inside and z["exit"]:
+                out.append(("geo_out", n["id"], f"📍 {n['name']} вийшов із зони «{z['name']}»"))
+    return out
+
+
+# ---- проблеми мережі: підказки зі списку вузлів і журналу пакетів (лише читання) -----------------------------------------------
+AIR_TX_WARN = 10.0        # %: ліміт ефіру 10% за годину в ЄС; перевищення шкодить усім
+ISSUE_CHAN = 40.0
+BAT_LOW = 15
+RELAY_SHARE_WARN, RELAY_MIN = 0.6, 20
+ROUTERS = ("ROUTER", "ROUTER_LATE", "REPEATER")
+LEVEL_ORDER = {"crit": 0, "warn": 1, "info": 2}
+
+
+def mesh_issues(nodes, me_id, now=None, relays=None, chan=None):
+    """nodes: [{id, name, role, hops, snr, heard, lat, lon, air_tx, chan_util, bat, uptime, fav, mqtt}];
+    relays: [(id, name, пакетів)] за вікно (з журналу пакетів); chan: зайнятість каналу нашого вузла, %.
+    -> [{level, kind, node, text}], найважливіше вгорі."""
+    now = now or time.time()
+    out = []
+
+    def add(level, kind, node, text):
+        out.append({"level": level, "kind": kind, "node": node, "text": text})
+
+    live = [n for n in nodes if not n.get("mqtt") and n.get("heard") and now - n["heard"] < 6 * 3600]
+    for n in live:
+        nm, nid = n["name"], n["id"]
+        if isinstance(n.get("air_tx"), (int, float)) and n["air_tx"] >= AIR_TX_WARN:
+            add("warn", "airtime", nid, f"{nm} займає ефір: передає {n['air_tx']:.0f}% часу (прийнято до {AIR_TX_WARN:.0f}% за годину)")
+        if isinstance(n.get("bat"), (int, float)) and 0 <= n["bat"] <= BAT_LOW and (n.get("fav") or nid == me_id):
+            add("crit" if n["bat"] <= 5 else "warn", "battery", nid, f"{nm}: заряд {n['bat']:.0f}%")
+        if isinstance(n.get("uptime"), (int, float)) and 0 <= n["uptime"] < 600 and nid != me_id:
+            add("info", "reboot", nid, f"{nm} щойно перезапустився (працює {n['uptime'] // 60:.0f} хв)")
+        lat, lon = n.get("lat"), n.get("lon")
+        if lat is not None and lon is not None and ((lat == 0 and lon == 0) or abs(lat) > 90 or abs(lon) > 180):
+            add("info", "badpos", nid, f"{nm}: хибні координати ({lat}, {lon}); вузол не потрапить на карту")
+        if n.get("role") in ROUTERS and (lat is None or lon is None):
+            add("info", "router_nopos", nid, f"{nm} ({n['role']}) не має координат: його не видно на карті")
+        if n.get("hops") == 0 and isinstance(n.get("snr"), (int, float)) and n["snr"] < -15 and nid != me_id:
+            add("info", "weak", nid, f"Прямий зв'язок із {nm} на межі: SNR {n['snr']:.0f} дБ")
+    near_routers = [n for n in live if n.get("role") in ROUTERS and (n.get("hops") or 0) <= 1 and n["id"] != me_id]
+    if len(near_routers) >= 3:
+        add("info", "routers", "", f"Поруч {len(near_routers)} ретрансляторів ({', '.join(n['name'] for n in near_routers[:4])}): "
+            "зайві ретрансляції збільшують завантаження ефіру")
+    names: dict[str, list[str]] = {}
+    for n in nodes:
+        if n.get("name") and not n.get("mqtt"):
+            names.setdefault(n["name"], []).append(n["id"])
+    live_ids = {n["id"] for n in live}
+    for nm, ids in names.items():
+        if len(ids) > 1 and any(i in live_ids for i in ids):
+            add("info", "dupname", ids[0], f"Однакова коротка назва «{nm}» у {len(ids)} вузлів: їх легко сплутати")
+    total = sum(r[2] for r in relays or [])
+    if relays and total >= RELAY_MIN and len(relays) > 1:
+        rid, rname, cnt = max(relays, key=lambda r: r[2])
+        if cnt / total >= RELAY_SHARE_WARN:
+            add("info", "relay", rid, f"{rname} ретранслює {cnt / total * 100:.0f}% пакетів, які ми чуємо: якщо він зникне, зв'язок з рештою мережі втратиться")
+    if isinstance(chan, (int, float)) and chan >= ISSUE_CHAN:
+        add("warn", "chan", me_id, f"Ефір навколо нашого вузла зайнятий на {chan:.0f}%")
+    out.sort(key=lambda x: (LEVEL_ORDER[x["level"]], x["kind"]))
+    return out
+
+
+# ---- звіт про покриття: куди й наскільки далеко чуємо вузли -------------------------------------------------------------------
+BANDS_KM = (1, 3, 10, 30, 100)
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    p1, p2, dl = math.radians(lat1), math.radians(lat2), math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    xx = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, xx)) + 360) % 360
+
+
+def coverage(me_lat, me_lon, nodes, sectors=12, now=None, window=None):
+    """nodes: [{id, name, lat, lon, hops, snr, heard}]. Лише вузли з координатами, почуті за вікно (с; None = усі).
+    -> {n, farthest, direct_farthest, sectors: [{from, center, count, direct, max_km, max_name, max_direct_km, snr}], bands: [{upto, count}]}."""
+    now = now or time.time()
+    step = 360 / sectors
+    secs = [{"from": (k * step - step / 2) % 360, "center": k * step, "count": 0, "direct": 0, "max_km": 0.0, "max_name": None, "max_direct_km": 0.0, "snrs": []}
+            for k in range(sectors)]      # сектори центровані на сторони світу: 0° — північ посередині сектора
+    bands = [{"upto": b, "count": 0} for b in (*BANDS_KM, None)]
+    far = dfar = None
+    n_all = 0
+    for n in nodes:
+        lat, lon = n.get("lat"), n.get("lon")
+        if lat is None or lon is None or (lat == 0 and lon == 0) or n.get("mqtt"):
+            continue
+        if window and now - (n.get("heard") or 0) > window:
+            continue
+        d = haversine_km(me_lat, me_lon, lat, lon)
+        if d < 0.02:
+            continue
+        s = secs[int(((bearing_deg(me_lat, me_lon, lat, lon) + step / 2) % 360) // step) % sectors]
+        n_all += 1
+        s["count"] += 1
+        if d > s["max_km"]:
+            s["max_km"], s["max_name"] = d, n.get("name")
+        if n.get("hops") == 0:
+            s["direct"] += 1
+            s["max_direct_km"] = max(s["max_direct_km"], d)
+            if isinstance(n.get("snr"), (int, float)):
+                s["snrs"].append(n["snr"])
+            if dfar is None or d > dfar[0]:
+                dfar = (d, n.get("name"))
+        if far is None or d > far[0]:
+            far = (d, n.get("name"))
+        next(b for b in bands if b["upto"] is None or d <= b["upto"])["count"] += 1
+    for s in secs:
+        sn = sorted(s.pop("snrs"))
+        s["snr"] = sn[len(sn) // 2] if sn else None
+        for k in ("max_km", "max_direct_km"):
+            s[k] = round(s[k], 2)
+    return {"n": n_all, "farthest": {"km": round(far[0], 2), "name": far[1]} if far else None,
+            "direct_farthest": {"km": round(dfar[0], 2), "name": dfar[1]} if dfar else None, "sectors": secs, "bands": bands}
+
+
+def aircraft(alt_m, threshold=1000):
+    """Висота вузла за порогом (м над рівнем моря) майже напевно означає літак чи дрон, а не стаціонарний вузол."""
+    return isinstance(alt_m, (int, float)) and not isinstance(alt_m, bool) and alt_m >= threshold
+
+
+def like_escape(q):
+    """Текст для пошуку LIKE: спецсимволи % _ \ вважаються звичайними."""
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
