@@ -841,8 +841,13 @@ function stopReply() { replyTo = null; $('#replybar').hidden = true; }
 $('#replybar button').onclick = stopReply;
 $('#text').addEventListener('keydown', e => { if (e.key === 'Escape' && replyTo) stopReply(); });
 
+// Журнал тримається внизу (на останніх повідомленнях), поки ви самі не прогорнули вгору. Раніше це вираховувалося з розмірів
+// елемента, а в прихованій вкладці вони нульові, тому після відкриття «Повідомлень» журнал стояв на найстаріших.
+let logPinned = true;
+$('#log').addEventListener('scroll', e => { const b = e.target; if (b.clientHeight) logPinned = b.scrollHeight - b.scrollTop - b.clientHeight < 40; });
+window.addEventListener('resize', () => { const b = $('#log'); if (logPinned && b.clientHeight) b.scrollTop = b.scrollHeight; });  // вкладку щойно показано
 function renderMessages() {
-  const box = $('#log'), stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const box = $('#log'), stick = logPinned;
   box.replaceChildren();
   const list = msgs.filter(m => dmPeer(m) === tab), rs = reactionsOf(list);
   const byPid = new Map(msgs.filter(m => m.pid && !m.emoji).map(m => [m.pid, m]));  // для цитат: з усіх, не лише розмови
@@ -922,7 +927,7 @@ $('#forget').onclick = async () => {
   delete closed[id]; saveClosed(); opened.delete(id); openTab(''); refreshMessages();
 };
 function openTab(id) {
-  tab = id; stopReply(); $('#to').value = id || '^all';
+  tab = id; stopReply(); $('#to').value = id || '^all'; logPinned = true;
   renderTabs(); renderMessages();
 }
 function openConv(id) {  // клік по вузлу: приватна розмова з ним і він же адресат
@@ -981,6 +986,7 @@ $('#send').addEventListener('submit', async ev => {
   ev.preventDefault();
   try {
     const dest = replyTo ? replyDest(replyTo) : {to: $('#to').value, ch: +$('#ch').value};
+    logPinned = true;  // своє повідомлення показуємо внизу
     await api('/api/send', {text: $('#text').value, ...dest, ...(replyTo && {reply: replyTo.pid})});
     $('#text').value = ''; stopReply();
     const t = dest.to === '^all' ? '' : dest.to;  // надіслане — у своїй вкладці: приватне видно в розмові
