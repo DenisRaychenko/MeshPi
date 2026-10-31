@@ -87,9 +87,8 @@
     <h2>Ефір</h2>
     <p class="evnote">Усі текстові повідомлення, що дійшли до панелі, одним потоком: з усіх каналів і приватні. Приватні, адресовані іншим вузлам, видно лише якщо вузол їх передав і міг розшифрувати: сучасні приватні повідомлення шифруються ключем адресата, і їх прочитати неможливо.</p>
     <div class="row" style="margin-bottom:8px">
-      <select class="tg-input" id="etch" aria-label="Канал"><option value="">Усі канали</option></select>
-      <select class="tg-input" id="etkind" aria-label="Тип"><option value="all">Канали й приватні</option><option value="ch">Лише канали</option><option value="dm">Лише приватні</option></select>
-      <select class="tg-input" id="etwho" aria-label="Чиї"><option value="">Усі</option><option value="foreign">Приватні інших (не нам)</option></select>
+      <div id="ettabs" class="tabs" role="tablist" aria-label="Канали й приватні"></div>
+      <select class="tg-input" id="etwho" aria-label="Чиї"><option value="">Усі приватні</option><option value="foreign">Лише інших (не нам)</option></select>
       <input class="tg-input" id="etq" type="search" placeholder="Пошук у списку" autocomplete="off" aria-label="Пошук" style="min-width:12em">
       <span id="etcount" class="hint"></span>
     </div>

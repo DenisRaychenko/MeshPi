@@ -11,27 +11,35 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* без сховища — ок */ } },
   };
   let msgs = [], names = new Map(), chans = new Map(), raw = '', me = null;
-  const chSel = $id('etch'), kindSel = $id('etkind'), q = $id('etq'), who = $id('etwho');
-  kindSel.value = store.get('etkind', 'all');
-  if (!kindSel.value) kindSel.value = 'all';
+  const bar = $id('ettabs'), q = $id('etq'), who = $id('etwho');
+  let sel = store.get('etsel', 'all');  // all | dm | c<N>: усе, приватні або один канал (лише повідомлення в канал)
 
   const active = () => tab.classList.contains('active');
   const nm = id => id === '^all' ? 'усі' : (names.get(id) || id || '?');
   const isDm = m => !!m.to && m.to !== '^all';
   const chName = c => chans.get(c) ? `${c} · ${chans.get(c)}` : String(c);
 
-  function fillChannels(list) {  // канали: ті, що відомі вузлу, і ті, де вже були повідомлення
-    const keep = chSel.value, set = new Set([...chans.keys(), ...list.map(m => m.ch)]);
-    chSel.replaceChildren(new Option('Усі канали', ''));
-    for (const c of [...set].sort((a, b) => a - b)) chSel.append(new Option('Канал ' + chName(c), String(c)));
-    chSel.value = [...chSel.options].some(o => o.value === keep) ? keep : '';
+  const inView = (m, v) => v === 'all' || (v === 'dm' ? isDm(m) : !isDm(m) && 'c' + m.ch === v);
+
+  function renderTabs() {  // «Усі», кожен канал за назвою, «Приватні»; у дужках кількість
+    const set = new Set([...chans.keys(), ...msgs.filter(m => !isDm(m)).map(m => m.ch)]);
+    const items = [['all', 'Усі'], ...[...set].sort((a, b) => a - b).map(c => ['c' + c, chans.get(c) || 'Канал ' + c]), ['dm', '🔒 Приватні']];
+    if (!items.some(([v]) => v === sel)) sel = 'all';
+    bar.replaceChildren();
+    for (const [v, label] of items) {
+      const b = document.createElement('button'); b.type = 'button'; b.role = 'tab'; b.className = 'tab' + (v === 'dm' ? ' dm' : '');
+      b.ariaSelected = String(v === sel);
+      b.textContent = `${label} (${msgs.filter(m => !m.emoji && inView(m, v)).length})`;
+      b.onclick = () => { sel = v; store.set('etsel', v); renderTabs(); render(); };
+      bar.append(b);
+    }
+    who.hidden = sel !== 'dm';
+    if (who.hidden) who.value = '';
   }
 
   function render() {
-    const needle = q.value.trim().toLowerCase(), kind = kindSel.value, ch = chSel.value, only = who.value;
-    const list = msgs.filter(m => !m.emoji
-      && (!ch || String(m.ch) === ch)
-      && (kind === 'all' || (kind === 'dm') === isDm(m))
+    const needle = q.value.trim().toLowerCase(), only = who.value;
+    const list = msgs.filter(m => !m.emoji && inView(m, sel)
       && (only !== 'foreign' || (isDm(m) && !m.out && me && m.to !== me && m.from !== me))
       && (!needle || (m.text || '').toLowerCase().includes(needle) || nm(m.from).toLowerCase().includes(needle)));
     rows.replaceChildren();
@@ -70,12 +78,11 @@
       me = (st.node && st.node.id) || me;
       for (const c of (st.mqtt && st.mqtt.channels) || []) chans.set(c.index, c.name);
     } catch (e) { /* без імен — показуємо ID */ }
-    fillChannels(msgs);
+    renderTabs();
     render();
   }
 
-  kindSel.onchange = () => { store.set('etkind', kindSel.value); render(); };
-  for (const e of [chSel, who]) e.onchange = render;
+  who.onchange = render;
   q.addEventListener('input', render);
   new MutationObserver(() => { if (active()) refresh(); }).observe(tab, {attributes: true, attributeFilter: ['class']});
   setInterval(() => { if (active() && !document.hidden) refresh(); }, 5000);
