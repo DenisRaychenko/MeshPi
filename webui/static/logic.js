@@ -130,7 +130,10 @@ function dmTabs(list, extra = []) {
   return [...last].sort((a, b) => b[1] - a[1]).map(([p]) => p);
 }
 // Скільки вхідних (не реакцій) у вкладці новіші за since
-const unreadIn = (list, tab, since) => list.filter(m => !m.out && !m.emoji && dmPeer(m) === tab && m.t > since).length;
+// Вкладки чату: кожен канал окремо ('c0', 'c1', …: лише повідомлення в канал) і приватні розмови (ID вузла)
+const isChanTab = t => /^c\d+$/.test(t);
+const inTab = (m, t) => isChanTab(t) ? !dmPeer(m) && 'c' + (m.ch || 0) === t : dmPeer(m) === t;
+const unreadIn = (list, tab, since) => list.filter(m => !m.out && !m.emoji && inTab(m, tab) && m.t > since).length;
 
 // Потужність на антені за налаштуванням чипа: дБм → [дБм, мВт, оцінка?]; для кожного модуля з підсилювачем — своя таблиця
 // E22-400M33S — за графіком Ebyte «E22-M Series» v1.5 (VCC 5 В, 25 °C): точки 1, 4, 7, 11, 16, 21 дБм, між ними —

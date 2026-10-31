@@ -164,8 +164,5 @@ check("insights.js sends nothing to the air (only the geofence settings are writ
 check("the nodes table marks aircraft", "n.aircraft" in page)
 check("the chat log stays on the latest messages, also when the tab was hidden while it was drawn", "logPinned" in page and "addEventListener('resize'" in page)
 check("a script file may only be named without a path (the editor offers just the listed files)", "st.scripts" in c.get("/static/auto.js").get_data(as_text=True))
-ej = c.get("/static/ether.js").get_data(as_text=True)
-check("the Ефір tab is on the page, reads only /api/messages and shows foreign text as text",
-      'data-tab="ether"' in page and "etrows" in page and "ether.js" in page and "innerHTML" not in ej and "/api/send" not in ej
-      and "/api/messages" in ej and "'POST'" not in ej)
+check("the chat has one tab per channel (named) and the Ефір tab is gone", "chanIds" in page and "chanNames" in page and 'data-tab="ether"' not in page)
 sys.exit(0 if ok else 1)

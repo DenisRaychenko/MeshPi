@@ -28,7 +28,6 @@
 <nav id="tabbar" class="tabbar" role="tablist" aria-label="Розділи">
   <button type="button" role="tab" data-tab="overview">Огляд</button>
   <button type="button" role="tab" data-tab="messages">Повідомлення</button>
-  <button type="button" role="tab" data-tab="ether">Ефір</button>
   <button type="button" role="tab" data-tab="nodes">Вузли</button>
   <button type="button" role="tab" data-tab="events">Події<span id="evbadge"></span></button>
   <button type="button" role="tab" data-tab="mesh">Мережа</button>
@@ -81,23 +80,6 @@
     <div id="emopanel" class="emo-panel" hidden></div>
     <div id="quick" class="row" hidden style="margin-top:8px"></div>
   </section>
-  </div>
-  <div class="tabpane" data-tab="ether" role="tabpanel" hidden>
-<section class="panel">
-    <h2>Ефір</h2>
-    <p class="evnote">Усі текстові повідомлення, що дійшли до панелі, одним потоком: з усіх каналів і приватні. Приватні, адресовані іншим вузлам, видно лише якщо вузол їх передав і міг розшифрувати: сучасні приватні повідомлення шифруються ключем адресата, і їх прочитати неможливо.</p>
-    <div class="row" style="margin-bottom:8px">
-      <div id="ettabs" class="tabs" role="tablist" aria-label="Канали й приватні"></div>
-      <select class="tg-input" id="etwho" aria-label="Чиї"><option value="">Усі приватні</option><option value="foreign">Лише інших (не нам)</option></select>
-      <input class="tg-input" id="etq" type="search" placeholder="Пошук у списку" autocomplete="off" aria-label="Пошук" style="min-width:12em">
-      <span id="etcount" class="hint"></span>
-    </div>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Коли</th><th>Де</th><th>Від → кому</th><th>Текст</th></tr></thead>
-      <tbody id="etrows"></tbody>
-    </table></div>
-    <p id="etempty" class="hint" hidden>Повідомлень за цими умовами немає.</p>
-</section>
   </div>
   <div class="tabpane" data-tab="nodes" role="tabpanel" hidden>
 <div class="strip" id="mqttstrip" hidden><span class="label">MQTT</span><span id="mqtttxt" class="row" style="gap:10px"></span></div>
@@ -597,6 +579,8 @@ async function refreshStatus() {
         ['Зайнятість каналу', ...f(m.channelUtilization, '%')],
         ['Ефір TX', ...f(m.airUtilTx, '%')], ['Вузлів', s.node_count], txTile]);
     renderMqtt(s.mqtt);
+    chanNames = new Map(((s.mqtt && s.mqtt.channels) || []).map(c => [c.index, c.name]));
+    renderTabs();
     myId = s.node.id;
     $('#me').textContent = `${s.node.longName || '?'} (${s.node.shortName || '?'}) ${s.node.id || ''}`;  // підзаголовок шапки
   } catch (e) { $('#pilltxt').textContent = e.message; pill.className = 'status-pill offline'; ring(false); }
@@ -756,7 +740,7 @@ async function refreshNodes() {
     const to = $('#to'), cur = to.value;
     to.replaceChildren(new Option('Усім', '^all'));
     for (const n of list) if (n.id) to.append(new Option(n.long || n.id, n.id));
-    if (tab && ![...to.options].some(o => o.value === tab)) to.append(new Option(nameOf(tab), tab));  // розмова з вузлом поза списком
+    if (tab && !isChanTab(tab) && ![...to.options].some(o => o.value === tab)) to.append(new Option(nameOf(tab), tab));  // розмова з вузлом поза списком
     to.value = [...to.options].some(o => o.value === cur) ? cur : '^all';
   } catch (e) { /* статус уже показує проблему */ }
 }
@@ -868,7 +852,7 @@ window.addEventListener('resize', () => { const b = $('#log'); if (logPinned && 
 function renderMessages() {
   const box = $('#log'), stick = logPinned;
   box.replaceChildren();
-  const list = msgs.filter(m => dmPeer(m) === tab), rs = reactionsOf(list);
+  const list = msgs.filter(m => inTab(m, tab)), rs = reactionsOf(list);
   const byPid = new Map(msgs.filter(m => m.pid && !m.emoji).map(m => [m.pid, m]));  // для цитат: з усіх, не лише розмови
   for (const m of list) {
     if (m.emoji && rs.has(m.reply)) continue;  // показана значком біля свого повідомлення
@@ -912,41 +896,46 @@ function renderMessages() {
 }
 
 // Вкладки: «Канали» (повідомлення всім) і окремо кожна приватна розмова; лічильник — непрочитані вхідні
-let tab = '', tabSeen = null;  // tabSeen: вкладка → час останнього побаченого; null — ще не завантажено
+let tab = 'c0', tabSeen = null, chanNames = new Map();  // tabSeen: вкладка → час останнього побаченого; null — ще не завантажено
 const opened = new Set();      // розмови, відкриті кліком по вузлу, поки без повідомлень
 let closed = {};               // закриті вкладки: ID → час останнього повідомлення на момент закриття (історія лишається)
 try { closed = JSON.parse(localStorage.getItem('closedtabs')) || {}; } catch (e) { /* без сховища — нічого не закрито */ }
 const saveClosed = () => { try { localStorage.setItem('closedtabs', JSON.stringify(closed)); } catch (e) { /* ок */ } };
+// Канали: відомі вузлу (з назвою) і ті, де вже були повідомлення; завжди є 0-й
+const chanIds = () => [...new Set([0, ...chanNames.keys(), ...msgs.filter(m => !dmPeer(m)).map(m => m.ch || 0), ...(isChanTab(tab) ? [+tab.slice(1)] : [])])]
+  .sort((a, b) => a - b).map(c => 'c' + c);
+const chanLabel = id => chanNames.get(+id.slice(1)) || 'Канал ' + id.slice(1);
 function renderTabs() {
   const now = Math.max(0, ...msgs.map(m => m.t));
-  if (!tabSeen) tabSeen = new Map(['', ...dmTabs(msgs)].map(id => [id, now]));  // перше завантаження: уже прочитане
+  if (!tabSeen) tabSeen = new Map([...chanIds(), ...dmTabs(msgs)].map(id => [id, now]));  // перше завантаження: уже прочитане
   tabSeen.set(tab, now);
   const bar = $('#tabs'); bar.replaceChildren();
-  for (const id of ['', ...shownTabs(msgs, [...opened, tab].filter(Boolean), closed)]) {
+  for (const id of [...chanIds(), ...shownTabs(msgs, [...opened, tab].filter(id => id && !isChanTab(id)), closed)]) {
     const b = document.createElement('button'), n = unreadIn(msgs, id, tabSeen.get(id) ?? 0);
-    b.type = 'button'; b.role = 'tab'; b.className = 'tab' + (id ? ' dm' : ''); b.ariaSelected = String(id === tab);
-    b.textContent = id ? '🔒 ' + nameOf(id) : 'Канали'; b.title = id ? 'Приватна розмова · ' + id : 'Повідомлення всім';
+    const dm = !isChanTab(id); b.type = 'button'; b.role = 'tab'; b.className = 'tab' + (dm ? ' dm' : ''); b.ariaSelected = String(id === tab);
+    b.textContent = dm ? '🔒 ' + nameOf(id) : chanLabel(id); b.title = dm ? 'Приватна розмова · ' + id : 'Канал ' + id.slice(1) + ': повідомлення всім';
     if (n) { const c = document.createElement('span'); c.className = 'count'; c.textContent = n; b.append(c); }
-    if (id) {  // × — закрити вкладку; історія лишається, нове повідомлення знову її відкриє
+    if (dm) {  // × — закрити вкладку; історія лишається, нове повідомлення знову її відкриє
       const x = document.createElement('span'); x.className = 'close'; x.textContent = '×'; x.title = 'Закрити вкладку (історія лишається)';
       x.onclick = ev => { ev.stopPropagation(); closeTab(id); }; b.append(x);
     }
     b.onclick = () => openTab(id); bar.append(b);
   }
-  $('#forget').hidden = !tab;
+  $('#forget').hidden = isChanTab(tab);
 }
 function closeTab(id) {
   closed[id] = Math.max(0, ...msgs.filter(m => dmPeer(m) === id).map(m => m.t)); saveClosed(); opened.delete(id);
-  if (tab === id) openTab(''); else renderTabs();
+  if (tab === id) openTab('c0'); else renderTabs();
 }
 $('#forget').onclick = async () => {
   const id = tab;
   if (!id || !confirm(`Видалити розмову з ${nameOf(id)} і всю її історію на платі? Відновити не можна.`)) return;
   try { await api('/api/forget', {peer: id}); } catch (e) { alert(e.message); return; }
-  delete closed[id]; saveClosed(); opened.delete(id); openTab(''); refreshMessages();
+  delete closed[id]; saveClosed(); opened.delete(id); openTab('c0'); refreshMessages();
 };
 function openTab(id) {
-  tab = id; stopReply(); $('#to').value = id || '^all'; logPinned = true;
+  tab = id; stopReply(); logPinned = true;
+  if (isChanTab(id)) { $('#to').value = '^all'; $('#ch').value = id.slice(1); } else $('#to').value = id;
   renderTabs(); renderMessages();
 }
 function openConv(id) {  // клік по вузлу: приватна розмова з ним і він же адресат
@@ -1008,7 +997,7 @@ $('#send').addEventListener('submit', async ev => {
     logPinned = true;  // своє повідомлення показуємо внизу
     await api('/api/send', {text: $('#text').value, ...dest, ...(replyTo && {reply: replyTo.pid})});
     $('#text').value = ''; stopReply();
-    const t = dest.to === '^all' ? '' : dest.to;  // надіслане — у своїй вкладці: приватне видно в розмові
+    const t = dest.to === '^all' ? 'c' + dest.ch : dest.to;  // надіслане — у своїй вкладці: приватне видно в розмові
     if (t !== tab) { opened.add(t); openTab(t); }
     refreshMessages();
   } catch (e) { alert(e.message); }
@@ -1310,7 +1299,6 @@ refreshPower().then(running => { if (running) watchBuild(); });  // збиран
 <script src="/static/quick.js"></script>
 <script src="/static/waypoints.js"></script>
 <script src="/static/events.js"></script>
-<script src="/static/ether.js"></script>
 <script src="/static/health.js"></script>
 <script src="/static/netview.js"></script>
 <script src="/static/rangetest.js"></script>

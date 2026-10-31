@@ -2124,7 +2124,11 @@ def mqtt_info(i):
     при ввімкненому модулі). Логін і пароль до MQTT-сервера не віддаємо."""
     try:
         mq = i.localNode.moduleConfig.mqtt
-        chans = [{"index": c.index, "name": c.settings.name or f"канал {c.index}",
+        try:  # безіменний основний канал у прошивці показується назвою пресета (LongFast, ShortTurbo…)
+            preset = "".join(w.capitalize() for w in LoRa.ModemPreset.Name(i.localNode.localConfig.lora.modem_preset).split("_"))
+        except Exception:  # noqa: BLE001
+            preset = "канал 0"
+        chans = [{"index": c.index, "name": c.settings.name or (preset if c.index == 0 else f"канал {c.index}"),
                   "uplink": bool(c.settings.uplink_enabled), "downlink": bool(c.settings.downlink_enabled)}
                  for c in (i.localNode.channels or []) if c.role != channel_pb2.Channel.DISABLED]
         return {"enabled": bool(mq.enabled), "address": mq.address, "root": mq.root,
